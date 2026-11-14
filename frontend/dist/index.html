@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Wildlife Deterrent System | ECE 3332: Microcontroller Project Lab | Group 8</title>
+    <script type="module" crossorigin src="/assets/index-5ion6LIM.js?v=7"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-d-e81-zd.css?v=7">
+  </head>
+  <body class="bg-[#090d14] text-[#e2e8f0] antialiased selection:bg-[#38bdf8]/20 selection:text-[#38bdf8]">
+    <div id="root"></div>
+
+    <!-- Live Camera Keyboard Controls (Strictly Scoped to Live Camera HUD Dialog) -->
+    <script>
+      (function() {
+        let mirrorH = true;
+        let mirrorV = false;
+        let rotation = 0;
+        let showHUD = true;
+
+        function getOpenLiveDialog() {
+          return document.querySelector('dialog[aria-labelledby="live-hud-title"][open]');
+        }
+
+        function showToast(msg) {
+          let toast = document.getElementById('sentinel-cam-toast');
+          if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'sentinel-cam-toast';
+            toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:rgba(9,14,26,0.94);border:1px solid #38bdf8;color:#38bdf8;padding:8px 18px;border-radius:8px;font-family:monospace;font-size:12px;font-weight:bold;z-index:99999;box-shadow:0 0 20px rgba(56,189,248,0.3);transition:opacity 0.25s ease;pointer-events:none;';
+            document.body.appendChild(toast);
+          }
+          toast.textContent = msg;
+          toast.style.opacity = '1';
+          clearTimeout(toast._timeout);
+          toast._timeout = setTimeout(() => { toast.style.opacity = '0'; }, 2200);
+        }
+
+        function syncSettingsFromBackend() {
+          fetch('/api/camera/control')
+            .then(r => r.json())
+            .then(res => {
+              if (res && res.settings) {
+                mirrorH = !!res.settings.mirror_h;
+                mirrorV = !!res.settings.mirror_v;
+                rotation = Number(res.settings.rotation || 0);
+                updateKeyBadge();
+              }
+            })
+            .catch(() => {});
+        }
+
+        function updateKeyBadge() {
+          const dialog = getOpenLiveDialog();
+          if (!dialog) return;
+          let badge = dialog.querySelector('#sentinel-key-badge');
+          if (!badge) {
+            badge = document.createElement('div');
+            badge.id = 'sentinel-key-badge';
+            badge.style.cssText = 'position:absolute;bottom:72px;left:50%;transform:translateX(-50%);display:flex;gap:12px;background:rgba(9,14,26,0.88);border:1px solid rgba(56,189,248,0.4);padding:6px 14px;border-radius:9999px;font-family:monospace;font-size:11px;font-weight:bold;color:#cbd5e1;backdrop-filter:blur(8px);z-index:60;pointer-events:none;';
+            dialog.appendChild(badge);
+          }
+          badge.innerHTML = `
+            <span><b style="color:#38bdf8;">[M]</b> Mirror: ${mirrorH ? '<span style="color:#4ade80;">ON</span>' : 'OFF'}</span>
+            <span><b style="color:#38bdf8;">[V]</b> Flip-V: ${mirrorV ? '<span style="color:#4ade80;">ON</span>' : 'OFF'}</span>
+            <span><b style="color:#38bdf8;">[R]</b> Rot: ${rotation}°</span>
+            <span><b style="color:#38bdf8;">[F]</b> Flip 180</span>
+            <span><b style="color:#38bdf8;">[S]</b> Snap</span>
+            <span><b style="color:#38bdf8;">[H]</b> HUD: ${showHUD ? '<span style="color:#4ade80;">ON</span>' : 'OFF'}</span>
+            <span><b style="color:#f43f5e;">[Esc/Q]</b> Close</span>
+          `;
+        }
+
+        setInterval(() => {
+          const dialog = getOpenLiveDialog();
+          if (dialog) {
+            if (!dialog.hasAttribute('data-csi-synced')) {
+              dialog.setAttribute('data-csi-synced', 'true');
+              syncSettingsFromBackend();
+            }
+            updateKeyBadge();
+          } else {
+            const closed = document.querySelector('dialog[aria-labelledby="live-hud-title"]:not([open])[data-csi-synced]');
+            if (closed) {
+              closed.removeAttribute('data-csi-synced');
+            }
+          }
+        }, 250);
+
+        window.addEventListener('keydown', (e) => {
+          const dialog = getOpenLiveDialog();
+          if (!dialog) return;
+          if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+
+          const key = e.key.toLowerCase();
+
+          if (key === 'm') {
+            e.preventDefault();
+            mirrorH = !mirrorH;
+            updateKeyBadge();
+            showToast(`HORIZONTAL MIRROR: ${mirrorH ? 'ON' : 'OFF'}`);
+            fetch('/api/camera/control', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ mirror_h: mirrorH })
+            }).catch(() => {});
+          } else if (key === 'v') {
+            e.preventDefault();
+            mirrorV = !mirrorV;
+            updateKeyBadge();
+            showToast(`VERTICAL MIRROR: ${mirrorV ? 'ON' : 'OFF'}`);
+            fetch('/api/camera/control', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ mirror_v: mirrorV })
+            }).catch(() => {});
+          } else if (key === 'r') {
+            e.preventDefault();
+            rotation = (rotation + 90) % 360;
+            updateKeyBadge();
+            showToast(`ROTATION: ${rotation}°`);
+            fetch('/api/camera/control', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ rotation: rotation })
+            }).catch(() => {});
+          } else if (key === 'f') {
+            e.preventDefault();
+            rotation = (rotation + 180) % 360;
+            updateKeyBadge();
+            showToast(`FLIP 180: ${rotation}°`);
+            fetch('/api/camera/control', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ rotation: rotation })
+            }).catch(() => {});
+          } else if (key === 's') {
+            e.preventDefault();
+            const snapBtn = dialog.querySelector('button.bg-emerald-500');
+            if (snapBtn && !snapBtn.disabled) {
+              snapBtn.click();
+              showToast('CAPTURING SNAPSHOT & RUNNING AI...');
+            }
+          } else if (key === 'h') {
+            e.preventDefault();
+            showHUD = !showHUD;
+            const canvas = dialog.querySelector('canvas:not(.hidden)');
+            if (canvas) canvas.style.display = showHUD ? 'block' : 'none';
+            updateKeyBadge();
+            showToast(`TACTICAL HUD: ${showHUD ? 'ON' : 'OFF'}`);
+          } else if (key === 'q') {
+            e.preventDefault();
+            const btns = Array.from(dialog.querySelectorAll('button'));
+            const closeBtn = btns.find(b => b.textContent && b.textContent.includes('EXIT FULLSCREEN'));
+            if (closeBtn) closeBtn.click();
+            else dialog.close();
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

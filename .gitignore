@@ -1,0 +1,64 @@
+# Exclude all images
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.png
+*.PNG
+*.gif
+*.GIF
+*.bmp
+*.BMP
+*.webp
+*.WEBP
+*.tiff
+*.TIFF
+*.heic
+*.HEIC
+*.ico
+*.svg
+
+# Exclude uploaded/recorded videos and runtime media directories
+*.mov
+*.MOV
+*.mp4
+*.MP4
+*.webm
+*.WEBM
+*.avi
+*.mkv
+uploads/
+results_db/
+thumbnails_db/
+sample_test_images/
+
+# Exclude dataset image directories and intermediate training build/caches
+custom_dataset/raw_images/
+custom_dataset/previews/
+custom_dataset/bird/
+custom_dataset/small_mammal/
+custom_dataset/large_mammal/
+custom_dataset/safe/
+custom_dataset/replay_buffer/
+custom_dataset/training_build/
+custom_dataset/runs/jetson_finetune/weights/
+*.cache
+
+# Exclude backup/intermediate large model exports (>50MB)
+best_pretrained_backup.pt
+best.onnx
+weights/
+
+# Python & SQLite runtime files
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.db
+*.db-shm
+*.db-wal
+
+# Node / Frontend build dependencies
+node_modules/
+.DS_Store
