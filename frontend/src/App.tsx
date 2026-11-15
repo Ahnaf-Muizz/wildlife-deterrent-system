@@ -68,6 +68,15 @@ export const App: React.FC = () => {
   const [selectedEvent, setSelectedEvent] = useState<DeterrentEventRecord | null>(null);
   const [isLiveCameraOpen, setIsLiveCameraOpen] = useState<boolean>(false);
 
+  // Live Camera stays exclusively on the Primary Host (127.0.0.1 / localhost);
+  // External PCs on the ESP32 Wi-Fi network (192.168.4.x) operate in Remote Upload Mode.
+  const isPrimaryHost =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1' ||
+      window.location.hostname === '::1' ||
+      new URLSearchParams(window.location.search).get('host') === '1');
+
   const [isMuted, setIsMuted] = useState<boolean>(notificationService.getMuted());
   const [notifPerm, setNotifPerm] = useState<NotificationPermission>(
     notificationService.getPermissionState()
@@ -96,6 +105,10 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     fetchDashboard();
+    const syncTimer = window.setInterval(() => {
+      fetchDashboard();
+    }, 3500);
+    return () => clearInterval(syncTimer);
   }, [fetchDashboard]);
 
   // Smooth telemetry countdown polling while actuators are active + periodic ESP32 status check
@@ -209,11 +222,14 @@ export const App: React.FC = () => {
       <TopTelemetryBar
         telemetry={telemetry}
         models={models}
+        isPrimaryHost={isPrimaryHost}
         isMuted={isMuted}
         notificationPermission={notifPerm}
         onToggleMute={handleToggleMute}
         onRequestNotifications={handleRequestNotifications}
-        onOpenLiveCamera={() => setIsLiveCameraOpen(true)}
+        onOpenLiveCamera={() => {
+          if (isPrimaryHost) setIsLiveCameraOpen(true);
+        }}
         onStopAll={handleStopAll}
       />
 
@@ -352,8 +368,11 @@ export const App: React.FC = () => {
           {/* Left Control Column (4 cols) */}
           <div className="flex flex-col gap-6 lg:col-span-4 xl:col-span-3">
             <MediaScannerPanel
+              isPrimaryHost={isPrimaryHost}
               onUploadMedia={handleUploadMedia}
-              onOpenLiveCamera={() => setIsLiveCameraOpen(true)}
+              onOpenLiveCamera={() => {
+                if (isPrimaryHost) setIsLiveCameraOpen(true);
+              }}
               onSelectEvent={(ev) => setSelectedEvent(ev)}
             />
 
@@ -388,15 +407,17 @@ export const App: React.FC = () => {
         </div>
       </main>
 
-      {/* Full-Screen Live Camera Optical HUD Modal */}
-      <FullPageLiveCamera
-        isOpen={isLiveCameraOpen}
-        onClose={() => setIsLiveCameraOpen(false)}
-        telemetry={telemetry}
-        onTelemetryUpdate={(t) => setTelemetry(t)}
-        onSnapshotSaved={() => fetchDashboard()}
-        onStopAll={handleStopAll}
-      />
+      {/* Full-Screen Live Camera Optical HUD Modal (Primary Host Only) */}
+      {isPrimaryHost && (
+        <FullPageLiveCamera
+          isOpen={isLiveCameraOpen}
+          onClose={() => setIsLiveCameraOpen(false)}
+          telemetry={telemetry}
+          onTelemetryUpdate={(t) => setTelemetry(t)}
+          onSnapshotSaved={() => fetchDashboard()}
+          onStopAll={handleStopAll}
+        />
+      )}
 
       {/* Event Detail & Video Timeline Inspection Modal */}
       <EventDetailModal

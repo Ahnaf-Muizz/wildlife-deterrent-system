@@ -3,13 +3,14 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include "buzzer.h"
+#include "pump.h"
 #include "websocket.h"
 
 // ==========================================
 // SOFTAP WI-FI CONFIGURATION
 // ==========================================
-const char* AP_SSID = "Sentinel-Deterrent-AP";
-const char* AP_PASS = "sentinel2026";
+const char* AP_SSID = "Wildlife-Deterrent-System-AP";
+const char* AP_PASS = "haustein26";
 
 IPAddress local_IP(192, 168, 4, 1);
 IPAddress gateway(192, 168, 4, 1);
@@ -75,11 +76,12 @@ void handleRoot() {
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; text-align: center; }
     h1 { color: #58a6ff; font-size: 22px; margin-bottom: 5px; }
     .badge { display: inline-block; padding: 5px 12px; border-radius: 12px; font-size: 13px; font-weight: bold; background: rgba(46,160,67,0.2); color: #3fb950; border: 1px solid #3fb950; margin-bottom: 20px; }
-    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; max-width: 420px; margin: 0 auto 20px auto; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); text-align: left; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; max-width: 440px; margin: 0 auto 20px auto; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); text-align: left; }
     .btn { display: block; width: 100%; padding: 12px; margin: 10px 0; border: none; border-radius: 6px; font-size: 15px; font-weight: bold; cursor: pointer; transition: 0.2s; }
     .btn-bird { background: #1f6feb; color: white; }
     .btn-small { background: #d29922; color: black; }
     .btn-large { background: #f85149; color: white; }
+    .btn-water { background: #00b4d8; color: black; }
     .btn-test { background: #8957e5; color: white; }
     .btn-stop { background: #30363d; color: #f85149; border: 1px solid #f85149; }
     .btn:hover { opacity: 0.85; }
@@ -88,15 +90,16 @@ void handleRoot() {
 </head>
 <body>
   <h1>Sentinel Actuator Node</h1>
-  <div class="badge">SOFTAP ONLINE: 192.168.4.1 (LOW LATENCY)</div>
+  <div class="badge">SOFTAP ONLINE: 192.168.4.1 (GPIO 17 BUZZER + GPIO 18 PUMP)</div>
 
   <div class="card">
-    <h3 style="margin-top:0;">Manual Trigger (Randomized Durations)</h3>
-    <button class="btn btn-bird" onclick="sendCmd('BIRD')">Trigger BIRD (3-6s Randomized)</button>
-    <button class="btn btn-small" onclick="sendCmd('SMALL MAMMAL')">Trigger SMALL MAMMAL (5-9s Randomized)</button>
-    <button class="btn btn-large" onclick="sendCmd('LARGE MAMMAL')">Trigger LARGE MAMMAL (8-14s Randomized)</button>
-    <button class="btn btn-test" onclick="sendCmd('SOUND_TEST')">Sound Pattern Test</button>
-    <button class="btn btn-stop" onclick="sendCmd('STOP')">Silence / Stop</button>
+    <h3 style="margin-top:0;">Manual Trigger (Randomized by Class Level)</h3>
+    <button class="btn btn-bird" onclick="sendCmd('BIRD')">BIRD: Sound 3-6s (Pump OFF)</button>
+    <button class="btn btn-small" onclick="sendCmd('SMALL MAMMAL')">SMALL MAMMAL: Sound 5-9s + Pump 2.5-5s</button>
+    <button class="btn btn-large" onclick="sendCmd('LARGE MAMMAL')">LARGE MAMMAL: Sound 8-14s + Pump 5-9s</button>
+    <button class="btn btn-water" onclick="sendCmd('WATER_TEST')">Water Pump Test Only (GPIO 18: 2.5-5s)</button>
+    <button class="btn btn-test" onclick="sendCmd('SOUND_TEST')">Sound Pattern Test Only (GPIO 17)</button>
+    <button class="btn btn-stop" onclick="sendCmd('STOP')">Silence / Stop All (SAFE Override)</button>
     <div class="status-box" id="log">Waiting for action...</div>
   </div>
 
@@ -110,7 +113,11 @@ void handleRoot() {
       })
       .then(res => res.json())
       .then(data => {
-        document.getElementById('log').innerText = 'Target: ' + (data.target || data.action) + ' | Duration: ' + (data.duration_ms || 0) + 'ms | Buzzer: ' + data.buzzer_active;
+        document.getElementById('log').innerText =
+          'Target: ' + (data.target || data.action) +
+          ' | Duration: ' + (data.duration_ms || 0) + 'ms' +
+          ' | Buzzer: ' + data.buzzer_active +
+          ' | Pump: ' + data.pump_active + ' (' + (data.pump_duration_ms || 0) + 'ms)';
       })
       .catch(err => {
         document.getElementById('log').innerText = 'Error: ' + err;
@@ -132,6 +139,14 @@ void handleStatus() {
   uint32_t uptimeSec = millis() / 1000;
   uint8_t stationCount = WiFi.softAPgetStationNum();
 
+  uint32_t buzDur = getCurrentDurationMs();
+  uint32_t pmpDur = getCurrentPumpDurationMs();
+  uint32_t maxDur = (buzDur >= pmpDur) ? buzDur : pmpDur;
+
+  uint32_t buzRem = getRemainingDurationMs();
+  uint32_t pmpRem = getRemainingPumpDurationMs();
+  uint32_t maxRem = (buzRem >= pmpRem) ? buzRem : pmpRem;
+
   String json = "{";
   json += "\"status\":\"ARMED\",";
   json += "\"system\":\"Sentinel ESP32 Deterrent\",";
@@ -140,8 +155,11 @@ void handleStatus() {
   json += "\"connected_stations\":" + String(stationCount) + ",";
   json += "\"last_target\":\"" + getLastTarget() + "\",";
   json += "\"buzzer_active\":" + String(isBuzzerActive() ? "true" : "false") + ",";
-  json += "\"duration_ms\":" + String(getCurrentDurationMs()) + ",";
-  json += "\"remaining_ms\":" + String(getRemainingDurationMs()) + ",";
+  json += "\"pump_active\":" + String(isPumpActive() ? "true" : "false") + ",";
+  json += "\"duration_ms\":" + String(maxDur) + ",";
+  json += "\"remaining_ms\":" + String(maxRem) + ",";
+  json += "\"pump_duration_ms\":" + String(pmpDur) + ",";
+  json += "\"pump_remaining_ms\":" + String(pmpRem) + ",";
   json += "\"uptime_sec\":" + String(uptimeSec);
   json += "}";
 
@@ -170,7 +188,7 @@ void handleCommand() {
     }
   }
 
-  // Fallback to URL query or standard form arguments (e.g. /command?animal=BIRD&duration=4500)
+  // Fallback to URL query or standard form arguments (e.g. /command?animal=SMALL&duration=6500)
   if (target.length() == 0 && server.hasArg("animal")) target = server.arg("animal");
   if (target.length() == 0 && server.hasArg("target")) target = server.arg("target");
   if (target.length() == 0 && server.hasArg("action")) target = server.arg("action");
@@ -188,27 +206,62 @@ void handleCommand() {
     return;
   }
 
-  if (target.equalsIgnoreCase("OFF") || target.equalsIgnoreCase("STOP")) {
+  // 1. Human Safety Override (SAFE) or Explicit Stop -> Immediately shut off Buzzer & Water Pump
+  if (target.equalsIgnoreCase("OFF") || target.equalsIgnoreCase("STOP") || target.equalsIgnoreCase("SAFE")) {
     stopBuzzer();
-    broadcastWebSocket("{\"event\":\"stopped\",\"buzzer_active\":false,\"duration_ms\":0,\"remaining_ms\":0}");
-    server.send(200, "application/json", "{\"status\":\"success\",\"action\":\"STOPPED\",\"buzzer_active\":false,\"duration_ms\":0}");
+    stopPump();
+    broadcastWebSocket("{\"event\":\"stopped\",\"buzzer_active\":false,\"pump_active\":false,\"duration_ms\":0,\"remaining_ms\":0,\"pump_duration_ms\":0}");
+    server.send(200, "application/json", "{\"status\":\"success\",\"action\":\"STOPPED\",\"buzzer_active\":false,\"pump_active\":false,\"duration_ms\":0,\"pump_duration_ms\":0}");
     return;
   }
 
-  // Acknowledge individual Water or Light test commands without firing the piezo buzzer
-  if (target.equalsIgnoreCase("WATER_TEST") || target.equalsIgnoreCase("LIGHT_TEST")) {
+  // 2. Water Pump Test Command (GPIO 18 ONLY, Buzzer remains OFF)
+  if (target.equalsIgnoreCase("WATER_TEST") || target.equalsIgnoreCase("PUMP_TEST") || target.equalsIgnoreCase("WATER")) {
+    uint32_t pumpDurMs = triggerPump("WATER_TEST", requestedDurationMs);
+    Serial.printf("[HTTP] Water Pump Test (GPIO %d): %u ms from %s\n", PUMP_PIN, pumpDurMs, server.client().remoteIP().toString().c_str());
+    String wsMsg = "{\"event\":\"actuator_test\",\"target\":\"WATER_TEST\",\"duration_ms\":" + String(pumpDurMs) +
+                   ",\"pump_duration_ms\":" + String(pumpDurMs) +
+                   ",\"buzzer_active\":" + String(isBuzzerActive() ? "true" : "false") +
+                   ",\"pump_active\":true}";
+    broadcastWebSocket(wsMsg);
+    server.send(200, "application/json",
+                "{\"status\":\"success\",\"target\":\"WATER_TEST\",\"duration_ms\":" + String(pumpDurMs) +
+                ",\"pump_duration_ms\":" + String(pumpDurMs) +
+                ",\"buzzer_active\":" + String(isBuzzerActive() ? "true" : "false") +
+                ",\"pump_active\":true}");
+    return;
+  }
+
+  // 3. Light Test Command (Buzzer & Pump remain untouched)
+  if (target.equalsIgnoreCase("LIGHT_TEST")) {
     uint32_t simDuration = (requestedDurationMs > 0) ? requestedDurationMs : 4500;
-    Serial.printf("[HTTP] Actuator Test Command: '%s' (%u ms) from %s\n", target.c_str(), simDuration, server.client().remoteIP().toString().c_str());
-    broadcastWebSocket("{\"event\":\"actuator_test\",\"target\":\"" + target + "\",\"duration_ms\":" + String(simDuration) + ",\"buzzer_active\":" + String(isBuzzerActive() ? "true" : "false") + "}");
-    server.send(200, "application/json", "{\"status\":\"success\",\"target\":\"" + target + "\",\"duration_ms\":" + String(simDuration) + ",\"buzzer_active\":" + String(isBuzzerActive() ? "true" : "false") + "}");
+    Serial.printf("[HTTP] Light Test Command (%u ms) from %s\n", simDuration, server.client().remoteIP().toString().c_str());
+    broadcastWebSocket("{\"event\":\"actuator_test\",\"target\":\"LIGHT_TEST\",\"duration_ms\":" + String(simDuration) +
+                       ",\"buzzer_active\":" + String(isBuzzerActive() ? "true" : "false") +
+                       ",\"pump_active\":" + String(isPumpActive() ? "true" : "false") + "}");
+    server.send(200, "application/json",
+                "{\"status\":\"success\",\"target\":\"LIGHT_TEST\",\"duration_ms\":" + String(simDuration) +
+                ",\"buzzer_active\":" + String(isBuzzerActive() ? "true" : "false") +
+                ",\"pump_active\":" + String(isPumpActive() ? "true" : "false") + "}");
     return;
   }
 
+  // 4. Class Deterrent Trigger (BIRD / SMALL MAMMAL / LARGE MAMMAL) or SOUND_TEST*
   uint32_t actualDurationMs = triggerDeterrent(target, requestedDurationMs);
-  Serial.printf("[HTTP] Triggered '%s' (Randomized/Resolved Duration: %u ms) from %s\n", target.c_str(), actualDurationMs, server.client().remoteIP().toString().c_str());
+  uint32_t pumpDurMs = triggerPump(target, 0); // Randomizes pump duration by class level (0ms for BIRD / SOUND_TEST)
+  bool pumpOn = (pumpDurMs > 0) || isPumpActive();
 
-  broadcastWebSocket("{\"event\":\"triggered\",\"target\":\"" + target + "\",\"duration_ms\":" + String(actualDurationMs) + ",\"remaining_ms\":" + String(actualDurationMs) + ",\"buzzer_active\":true}");
-  server.send(200, "application/json", "{\"status\":\"success\",\"target\":\"" + target + "\",\"duration_ms\":" + String(actualDurationMs) + ",\"remaining_ms\":" + String(actualDurationMs) + ",\"buzzer_active\":true}");
+  Serial.printf("[HTTP] Triggered '%s' (Sound GPIO %d: %u ms, Water Pump GPIO %d: %u ms) from %s\n",
+                target.c_str(), PIN_BUZZER, actualDurationMs, PUMP_PIN, pumpDurMs, server.client().remoteIP().toString().c_str());
+
+  String payload = "{\"status\":\"success\",\"event\":\"triggered\",\"target\":\"" + target +
+                   "\",\"duration_ms\":" + String(actualDurationMs) +
+                   ",\"remaining_ms\":" + String(actualDurationMs) +
+                   ",\"pump_duration_ms\":" + String(pumpDurMs) +
+                   ",\"buzzer_active\":true,\"pump_active\":" + String(pumpOn ? "true" : "false") + "}";
+
+  broadcastWebSocket(payload);
+  server.send(200, "application/json", payload);
 }
 
 void handleNotFound() {
@@ -224,11 +277,12 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n==================================================");
-  Serial.println("  SENTINEL WILDLIFE DETERRENT ESP32 NODE (v2.0)");
+  Serial.println("  SENTINEL WILDLIFE DETERRENT ESP32 NODE (v2.1)");
   Serial.println("==================================================");
 
-  // 1. Initialize Buzzer on GPIO 17 with Persistent FreeRTOS Worker
+  // 1. Initialize Sound Buzzer (GPIO 17) & Water Pump (GPIO 18, Default LOW/OFF)
   setupBuzzer();
+  setupPump();
 
   // 2. Start Wi-Fi SoftAP with Modem Sleep Disabled for Zero Latency (<5ms RTT)
   WiFi.mode(WIFI_AP);

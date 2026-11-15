@@ -3,12 +3,14 @@ import { Upload, FileImage, FileVideo, Loader2, Camera, CheckCircle2, AlertTrian
 import { DeterrentEventRecord } from '../types/sentinel';
 
 interface MediaScannerPanelProps {
+  isPrimaryHost?: boolean;
   onUploadMedia: (file: File, conf: number) => Promise<DeterrentEventRecord | null>;
   onOpenLiveCamera: () => void;
   onSelectEvent: (ev: DeterrentEventRecord) => void;
 }
 
 export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
+  isPrimaryHost = true,
   onUploadMedia,
   onOpenLiveCamera,
   onSelectEvent,
@@ -82,23 +84,25 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
       </div>
 
       {/* Mode Switch Buttons */}
-      <div className="mb-4 grid grid-cols-2 gap-2">
+      <div className={`mb-4 grid gap-2 ${isPrimaryHost ? 'grid-cols-2' : 'grid-cols-1'}`}>
         <button
           type="button"
           onClick={() => fileInputRef.current?.click()}
           className="flex items-center justify-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/15 py-2.5 font-mono-tabular text-xs font-bold text-sky-300 transition hover:bg-sky-500/25 cursor-pointer"
         >
           <Upload className="h-3.5 w-3.5" />
-          UPLOAD MEDIA
+          {isPrimaryHost ? 'UPLOAD MEDIA' : 'UPLOAD MEDIA ONLY (REMOTE PC)'}
         </button>
-        <button
-          type="button"
-          onClick={onOpenLiveCamera}
-          className="flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 py-2.5 font-mono-tabular text-xs font-bold text-slate-200 transition hover:border-sky-400/50 hover:text-sky-300 cursor-pointer"
-        >
-          <Camera className="h-3.5 w-3.5 text-sky-400" />
-          FULLSCREEN LIVE CAM
-        </button>
+        {isPrimaryHost && (
+          <button
+            type="button"
+            onClick={onOpenLiveCamera}
+            className="flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 py-2.5 font-mono-tabular text-xs font-bold text-slate-200 transition hover:border-sky-400/50 hover:text-sky-300 cursor-pointer"
+          >
+            <Camera className="h-3.5 w-3.5 text-sky-400" />
+            FULLSCREEN LIVE CAM
+          </button>
+        )}
       </div>
 
       <form onSubmit={handleScanSubmit}>

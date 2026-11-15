@@ -62,3 +62,56 @@ venv/
 # Node / Frontend build dependencies
 node_modules/
 .DS_Store
+
+# Exclude PDFs, Excel spreadsheets, Presentations, Word docs, and local dataset/deploy folders
+*.pdf
+*.PDF
+*.xlsx
+*.XLSX
+*.xls
+*.XLS
+*.csv.bak
+*.pptx
+*.PPTX
+*.ppt
+*.PPT
+*.docx
+*.DOCX
+*.doc
+*.DOC
+*.zip
+*.tar
+*.tar.gz
+deploy_package/
+Wildlife Dataset/
+esp32_water_sprinkler_sound_deterrent/
+test_deterrents.py
+verify_all_features.py
+verify_cascade.py
+
+# Exclude legacy local training & laptop scratch files
+01_download_lila.py
+02_download_coco.py
+03_build_dataset.py
+04_download_more_cct.py
+05_build_v2_dataset.py
+06_add_data.py
+07_build_expanded_4class_dataset.py
+Pigeon-detection-6/
+Project_Summary_Log.txt
+clean_epochs.txt
+export.py
+extract_daylight_variety.py
+extract_perfect_tests.py
+monitor_epochs.py
+patch_human_only_safe.py
+stats.md
+stats_clean.md
+test_webcam.py
+train.py
+training_summary_report.md
+upload_server.py
+webcam_server.py
+yolo11m.pt
+frontend/package-lock.json
+frontend/tsconfig.tsbuildinfo

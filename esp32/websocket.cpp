@@ -1,5 +1,6 @@
 #include "websocket.h"
 #include "buzzer.h"
+#include "pump.h"
 #include <WebSocketsServer.h>
 
 static WebSocketsServer webSocket = WebSocketsServer(81);
@@ -44,8 +45,10 @@ static void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size
       
       String welcome = "{\"event\":\"connected\",\"system\":\"Sentinel-ESP32\",\"last_target\":\"" + 
                         getLastTarget() + "\",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") +
+                        ",\"pump_active\":" + (isPumpActive() ? "true" : "false") +
                         ",\"duration_ms\":" + String(getCurrentDurationMs()) +
-                        ",\"remaining_ms\":" + String(getRemainingDurationMs()) + "}";
+                        ",\"remaining_ms\":" + String(getRemainingDurationMs()) +
+                        ",\"pump_duration_ms\":" + String(getCurrentPumpDurationMs()) + "}";
       webSocket.sendTXT(num, welcome);
       break;
     }
@@ -73,16 +76,32 @@ static void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size
 
       target.trim();
 
-      if (target.equalsIgnoreCase("STOP") || target.equalsIgnoreCase("OFF")) {
+      if (target.equalsIgnoreCase("STOP") || target.equalsIgnoreCase("OFF") || target.equalsIgnoreCase("SAFE")) {
         stopBuzzer();
-        broadcastWebSocket("{\"event\":\"stopped\",\"buzzer_active\":false,\"duration_ms\":0,\"remaining_ms\":0}");
-      } else if (target.equalsIgnoreCase("WATER_TEST") || target.equalsIgnoreCase("LIGHT_TEST")) {
+        stopPump();
+        broadcastWebSocket("{\"event\":\"stopped\",\"buzzer_active\":false,\"pump_active\":false,\"duration_ms\":0,\"remaining_ms\":0,\"pump_duration_ms\":0}");
+      } else if (target.equalsIgnoreCase("WATER_TEST") || target.equalsIgnoreCase("PUMP_TEST") || target.equalsIgnoreCase("WATER")) {
+        uint32_t pumpDur = triggerPump("WATER_TEST", requestedDurationMs);
+        String ack = "{\"event\":\"actuator_test\",\"target\":\"WATER_TEST\",\"duration_ms\":" + String(pumpDur) +
+                     ",\"pump_duration_ms\":" + String(pumpDur) +
+                     ",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") +
+                     ",\"pump_active\":true}";
+        broadcastWebSocket(ack);
+      } else if (target.equalsIgnoreCase("LIGHT_TEST")) {
         uint32_t simDur = (requestedDurationMs > 0) ? requestedDurationMs : 4500;
-        String ack = "{\"event\":\"actuator_test\",\"target\":\"" + target + "\",\"duration_ms\":" + String(simDur) + ",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") + "}";
+        String ack = "{\"event\":\"actuator_test\",\"target\":\"LIGHT_TEST\",\"duration_ms\":" + String(simDur) +
+                     ",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") +
+                     ",\"pump_active\":" + (isPumpActive() ? "true" : "false") + "}";
         broadcastWebSocket(ack);
       } else if (target.length() > 0) {
         uint32_t actualDurationMs = triggerDeterrent(target, requestedDurationMs);
-        String ack = "{\"event\":\"triggered\",\"target\":\"" + target + "\",\"duration_ms\":" + String(actualDurationMs) + ",\"remaining_ms\":" + String(actualDurationMs) + ",\"buzzer_active\":true}";
+        uint32_t pumpDurMs = triggerPump(target, 0);
+        bool pumpOn = (pumpDurMs > 0) || isPumpActive();
+        String ack = "{\"event\":\"triggered\",\"target\":\"" + target +
+                     "\",\"duration_ms\":" + String(actualDurationMs) +
+                     ",\"remaining_ms\":" + String(actualDurationMs) +
+                     ",\"pump_duration_ms\":" + String(pumpDurMs) +
+                     ",\"buzzer_active\":true,\"pump_active\":" + (pumpOn ? "true" : "false") + "}";
         broadcastWebSocket(ack);
       }
       break;

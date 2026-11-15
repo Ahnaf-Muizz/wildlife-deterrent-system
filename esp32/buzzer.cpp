@@ -1,7 +1,7 @@
 #include "buzzer.h"
 #include <esp_system.h>
 
-// Persistent FreeRTOS Worker & Atomic State Control
+// Persistent FreeRTOS Worker & Atomic State Control for Sound Buzzer
 static TaskHandle_t buzzerTaskHandle = NULL;
 static portMUX_TYPE buzzerMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -52,10 +52,12 @@ uint32_t getRandomizedClassDurationMs(const String& target) {
   if (t.indexOf("BIRD") >= 0 || t == "0") {
     return (uint32_t)random(3000, 6001);   // 3.0s - 6.0s
   }
-  if (t.indexOf("SMALL") >= 0 || t == "RABBIT" || t == "RACCOON" || t == "FOX" || t == "1") {
+  if (t.indexOf("SMALL") >= 0 || t == "SQUIRREL" || t == "DOG" || t == "CAT" ||
+      t == "RABBIT" || t == "RACCOON" || t == "FOX" || t == "1") {
     return (uint32_t)random(5000, 9001);   // 5.0s - 9.0s
   }
-  if (t.indexOf("LARGE") >= 0 || t == "DEER" || t == "COW" || t == "BEAR" || t == "2") {
+  if (t.indexOf("LARGE") >= 0 || t == "DEER" || t == "COYOTE" ||
+      t == "COW" || t == "BEAR" || t == "2") {
     return (uint32_t)random(8000, 14001);  // 8.0s - 14.0s
   }
   return (uint32_t)random(3500, 6001);     // Default / test burst
@@ -103,7 +105,7 @@ void stopBuzzer() {
   buzzerRunning = false;
   activeDurationMs = 0;
   silenceBuzzer();
-  Serial.println("[BUZZER] Deterrent immediately silenced.");
+  Serial.println("[BUZZER] Sound deterrent immediately silenced.");
 }
 
 // ==========================================
@@ -197,11 +199,11 @@ static void buzzerWorkerTask(void* parameter) {
     target.trim();
     lastExecutedTarget = target;
 
-    Serial.printf("\n[BUZZER] >>> Executing Randomized Deterrent for: %s (Total Duration: %u ms) <<<\n",
+    Serial.printf("\n[BUZZER] >>> Executing Randomized Sound Deterrent for: %s (Duration: %u ms) <<<\n",
                   target.c_str(), maxDuration);
 
     while (!shouldAbort()) {
-      // 1. BIRD: RaptorScreech -> RaptorScreech -> StaccatoAlarm (with randomized sub-durations)
+      // 1. BIRD (or SOUND_TEST_BIRD): RaptorScreech -> RaptorScreech -> StaccatoAlarm
       if (target.indexOf("BIRD") >= 0 || target == "0") {
         playRaptorScreech(random(3, 7), random(8, 18));
         if (!waitInterruptible(random(60, 160))) break;
@@ -210,8 +212,9 @@ static void buzzerWorkerTask(void* parameter) {
         playStaccatoAlarm(random(3, 9), random(45, 95), random(25, 65));
         if (!waitInterruptible(random(80, 180))) break;
       }
-      // 2. SMALL MAMMAL: PredatorClicking -> RaptorScreech -> HarshWarble -> StaccatoAlarm
-      else if (target.indexOf("SMALL") >= 0 || target == "RABBIT" || target == "RACCOON" || target == "FOX" || target == "1") {
+      // 2. SMALL MAMMAL (or SOUND_TEST_SMALL): PredatorClicking -> RaptorScreech -> HarshWarble -> StaccatoAlarm
+      else if (target.indexOf("SMALL") >= 0 || target == "SQUIRREL" || target == "DOG" || target == "CAT" ||
+               target == "RABBIT" || target == "RACCOON" || target == "FOX" || target == "1") {
         playPredatorClicking(random(10, 28));
         if (!waitInterruptible(random(50, 130))) break;
         playRaptorScreech(random(3, 6), random(10, 20));
@@ -221,8 +224,9 @@ static void buzzerWorkerTask(void* parameter) {
         playStaccatoAlarm(random(4, 9), random(50, 90), random(30, 60));
         if (!waitInterruptible(random(80, 170))) break;
       }
-      // 3. LARGE MAMMAL: PredatorClicking -> RaptorScreech -> StaccatoAlarm -> HarshWarble -> DualToneSiren
-      else if (target.indexOf("LARGE") >= 0 || target == "DEER" || target == "COW" || target == "BEAR" || target == "2") {
+      // 3. LARGE MAMMAL (or SOUND_TEST_LARGE): PredatorClicking -> RaptorScreech -> StaccatoAlarm -> HarshWarble -> DualToneSiren
+      else if (target.indexOf("LARGE") >= 0 || target == "DEER" || target == "COYOTE" ||
+               target == "COW" || target == "BEAR" || target == "2") {
         playPredatorClicking(random(12, 30));
         if (!waitInterruptible(random(40, 110))) break;
         playRaptorScreech(random(3, 6), random(10, 22));

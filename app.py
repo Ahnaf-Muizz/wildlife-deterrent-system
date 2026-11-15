@@ -1594,6 +1594,15 @@ class JetsonCameraHub:
             return cls._instance
 
     def _open_camera(self):
+        if os.name == "nt":
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(0)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            return cap
+
         sid = _camera_state.get("sensor_id", 0)
         flip = _camera_state.get("flip_method", 0)
         # Bare hardware GStreamer pipeline (camera_overrides.isp + software AWB handle white balance;
@@ -1817,11 +1826,41 @@ def serve_spa(path):
     )
 
 
+def _get_local_ipv4_addresses() -> list[str]:
+    ips: list[str] = []
+    try:
+        import socket
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.168.4.1", 80))
+        ap_ip = s.getsockname()[0]
+        s.close()
+        if ap_ip and not ap_ip.startswith("127.") and ap_ip not in ips:
+            ips.insert(0, ap_ip)
+    except Exception:
+        pass
+    return ips
+
+
 if __name__ == "__main__":
+    lan_ips = _get_local_ipv4_addresses()
     print("\n" + "=" * 68)
     print("  SENTINEL WILDLIFE DETERRENT SYSTEM — COMMAND DASHBOARD v2.0")
-    print("  Local Laptop URL : http://127.0.0.1:5002")
+    print("  Primary Host URL : http://127.0.0.1:5002  (Full HUD + Live Camera)")
+    if lan_ips:
+        for lip in lan_ips:
+            print(f"  External PC URL  : http://{lip}:5002  (Remote Upload Mode)")
+    else:
+        print("  External PC URL  : http://192.168.4.2:5002  (When linked to ESP32 AP)")
     print("  Offline Mode     : ENABLED (Dual-Model YOLOv11m + COCO Cascade)")
     print("=" * 68 + "\n")
-    JetsonCameraHub.get_instance().start_if_needed()
+    if os.name != "nt":
+        JetsonCameraHub.get_instance().start_if_needed()
     app.run(host="0.0.0.0", port=5002, debug=False, threaded=True)

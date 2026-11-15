@@ -18,6 +18,7 @@ import { DeterrentTelemetry, ModelStatusInfo } from '../types/sentinel';
 interface TopTelemetryBarProps {
   telemetry: DeterrentTelemetry;
   models: ModelStatusInfo;
+  isPrimaryHost?: boolean;
   isMuted: boolean;
   notificationPermission: NotificationPermission;
   onToggleMute: () => void;
@@ -29,6 +30,7 @@ interface TopTelemetryBarProps {
 export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
   telemetry,
   models,
+  isPrimaryHost = true,
   isMuted,
   notificationPermission,
   onToggleMute,
@@ -187,15 +189,25 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
             {isMuted ? <VolumeX className="h-4 w-4 text-rose-400" /> : <Volume2 className="h-4 w-4 text-sky-400" />}
           </button>
 
-          <button
-            type="button"
-            onClick={onOpenLiveCamera}
-            className="flex items-center gap-2 rounded-lg border border-sky-400/40 bg-sky-500 px-4 py-2 font-mono-tabular text-xs font-bold tracking-wide text-slate-950 shadow-[0_0_20px_rgba(56,189,248,0.25)] transition hover:bg-sky-400 cursor-pointer"
-          >
-            <Camera className="h-4 w-4" />
-            <span>LIVE CAMERA HUD</span>
-            <Radio className="h-3.5 w-3.5 animate-pulse" />
-          </button>
+          {isPrimaryHost ? (
+            <button
+              type="button"
+              onClick={onOpenLiveCamera}
+              className="flex items-center gap-2 rounded-lg border border-sky-400/40 bg-sky-500 px-4 py-2 font-mono-tabular text-xs font-bold tracking-wide text-slate-950 shadow-[0_0_20px_rgba(56,189,248,0.25)] transition hover:bg-sky-400 cursor-pointer"
+            >
+              <Camera className="h-4 w-4" />
+              <span>LIVE CAMERA HUD</span>
+              <Radio className="h-3.5 w-3.5 animate-pulse" />
+            </button>
+          ) : (
+            <div
+              className="flex items-center gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-3.5 py-2 font-mono-tabular text-xs font-bold tracking-wide text-sky-300"
+              title="External PC connected via ESP32 Wi-Fi network — Live Camera remains active on the primary device"
+            >
+              <Wifi className="h-3.5 w-3.5 text-sky-400" />
+              <span>REMOTE UPLOAD NODE</span>
+            </div>
+          )}
         </div>
       </div>
     </header>
