@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
   Activity,
   AlertOctagon,
@@ -14,6 +14,7 @@ import {
   DeterrentTelemetry,
   ModelStatusInfo,
   PaginationInfo,
+  QrQueueSnapshot,
 } from './types/sentinel';
 import { TopTelemetryBar } from './components/TopTelemetryBar';
 import { MediaScannerPanel } from './components/MediaScannerPanel';
@@ -21,6 +22,8 @@ import { ActuatorTestPanel } from './components/ActuatorTestPanel';
 import { EventLogGallery } from './components/EventLogGallery';
 import { EventDetailModal } from './components/EventDetailModal';
 import { FullPageLiveCamera } from './components/FullPageLiveCamera';
+import { QrUploadModal } from './components/QrUploadModal';
+import { MobileQrUploadPage } from './components/MobileQrUploadPage';
 import { notificationService } from './services/notificationService';
 
 export const App: React.FC = () => {
@@ -67,6 +70,28 @@ export const App: React.FC = () => {
 
   const [selectedEvent, setSelectedEvent] = useState<DeterrentEventRecord | null>(null);
   const [isLiveCameraOpen, setIsLiveCameraOpen] = useState<boolean>(false);
+  const [isQrModalOpen, setIsQrModalOpen] = useState<boolean>(false);
+  const [qrQueueSnapshot, setQrQueueSnapshot] = useState<QrQueueSnapshot>({
+    queued_count: 0,
+    processing_count: 0,
+    active_count: 0,
+    completed_count: 0,
+    failed_count: 0,
+    jobs: [],
+    network: {
+      ips: [],
+      port: 5002,
+      primary_url: '',
+      urls: [],
+    },
+  });
+  const lastCompletedCountRef = useRef<number>(0);
+
+  const isMobileQrRoute =
+    typeof window !== 'undefined' &&
+    (window.location.pathname.startsWith('/qr-upload') ||
+      window.location.pathname.startsWith('/mobile-upload') ||
+      new URLSearchParams(window.location.search).get('mode') === 'mobile');
 
   // Live Camera stays exclusively on the Primary Host (127.0.0.1 / localhost);
   // External PCs on the ESP32 Wi-Fi network (192.168.4.x) operate in Remote Upload Mode.
@@ -103,13 +128,42 @@ export const App: React.FC = () => {
     }
   }, [targetFilter, mediaFilter, page]);
 
+  const fetchQrQueue = useCallback(async () => {
+    try {
+      const res = await fetch('/api/qr/queue');
+      if (!res.ok) return;
+      const snap: QrQueueSnapshot = await res.json();
+      setQrQueueSnapshot(snap);
+      if (snap.completed_count > lastCompletedCountRef.current) {
+        lastCompletedCountRef.current = snap.completed_count;
+        fetchDashboard();
+      } else {
+        lastCompletedCountRef.current = snap.completed_count;
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }, [fetchDashboard]);
+
   useEffect(() => {
+    if (isMobileQrRoute) return;
     fetchDashboard();
+    fetchQrQueue();
     const syncTimer = window.setInterval(() => {
       fetchDashboard();
+      fetchQrQueue();
     }, 3500);
     return () => clearInterval(syncTimer);
-  }, [fetchDashboard]);
+  }, [fetchDashboard, fetchQrQueue, isMobileQrRoute]);
+
+  useEffect(() => {
+    if (isMobileQrRoute) return;
+    if (!isQrModalOpen && qrQueueSnapshot.active_count === 0) return;
+    const fastTimer = window.setInterval(() => {
+      fetchQrQueue();
+    }, 1200);
+    return () => clearInterval(fastTimer);
+  }, [isQrModalOpen, qrQueueSnapshot.active_count, fetchQrQueue, isMobileQrRoute]);
 
   // Smooth telemetry countdown polling while actuators are active + periodic ESP32 status check
   useEffect(() => {
@@ -216,6 +270,40 @@ export const App: React.FC = () => {
     setNotifPerm(perm);
   };
 
+  const handleEnqueueFiles = async (files: FileList | File[], uploader = 'Dashboard Queue') => {
+    const formData = new FormData();
+    Array.from(files).forEach((f) => {
+      formData.append('files', f);
+    });
+    formData.append('conf', '0.50');
+    formData.append('uploader', uploader);
+
+    const res = await fetch('/api/qr/enqueue', {
+      method: 'POST',
+      body: formData,
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to enqueue files');
+    }
+    if (data.queue) {
+      setQrQueueSnapshot(data.queue);
+    }
+  };
+
+  const handleClearCompletedQueue = async () => {
+    const res = await fetch('/api/qr/queue/clear', { method: 'POST' });
+    if (res.ok) {
+      const snap: QrQueueSnapshot = await res.json();
+      setQrQueueSnapshot(snap);
+      lastCompletedCountRef.current = snap.completed_count;
+    }
+  };
+
+  if (isMobileQrRoute) {
+    return <MobileQrUploadPage />;
+  }
+
   return (
     <div className="flex min-h-screen flex-col bg-[#090d14] text-slate-100">
       {/* Top Command & Telemetry Header */}
@@ -225,11 +313,13 @@ export const App: React.FC = () => {
         isPrimaryHost={isPrimaryHost}
         isMuted={isMuted}
         notificationPermission={notifPerm}
+        activeQueueCount={qrQueueSnapshot.active_count}
         onToggleMute={handleToggleMute}
         onRequestNotifications={handleRequestNotifications}
         onOpenLiveCamera={() => {
           if (isPrimaryHost) setIsLiveCameraOpen(true);
         }}
+        onOpenQrModal={() => setIsQrModalOpen(true)}
         onStopAll={handleStopAll}
       />
 
@@ -373,6 +463,8 @@ export const App: React.FC = () => {
               onOpenLiveCamera={() => {
                 if (isPrimaryHost) setIsLiveCameraOpen(true);
               }}
+              onOpenQrModal={() => setIsQrModalOpen(true)}
+              qrQueueSnapshot={qrQueueSnapshot}
               onSelectEvent={(ev) => setSelectedEvent(ev)}
             />
 
@@ -426,6 +518,16 @@ export const App: React.FC = () => {
         onTelemetryUpdate={(t) => setTelemetry(t)}
         onClose={() => setSelectedEvent(null)}
         onDelete={handleDeleteEvent}
+      />
+
+      {/* QR Code Mobile Upload & FIFO Automatic Scan Queue Modal */}
+      <QrUploadModal
+        isOpen={isQrModalOpen}
+        onClose={() => setIsQrModalOpen(false)}
+        queueSnapshot={qrQueueSnapshot}
+        onEnqueueFiles={handleEnqueueFiles}
+        onClearCompleted={handleClearCompletedQueue}
+        onSelectEvent={(ev) => setSelectedEvent(ev)}
       />
     </div>
   );

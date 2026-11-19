@@ -1,11 +1,13 @@
 import React, { useRef, useState } from 'react';
-import { Upload, FileImage, FileVideo, Loader2, Camera, CheckCircle2, AlertTriangle } from 'lucide-react';
-import { DeterrentEventRecord } from '../types/sentinel';
+import { Upload, FileImage, FileVideo, Loader2, Camera, CheckCircle2, AlertTriangle, QrCode } from 'lucide-react';
+import { DeterrentEventRecord, QrQueueSnapshot } from '../types/sentinel';
 
 interface MediaScannerPanelProps {
   isPrimaryHost?: boolean;
   onUploadMedia: (file: File, conf: number) => Promise<DeterrentEventRecord | null>;
   onOpenLiveCamera: () => void;
+  onOpenQrModal: () => void;
+  qrQueueSnapshot?: QrQueueSnapshot;
   onSelectEvent: (ev: DeterrentEventRecord) => void;
 }
 
@@ -13,6 +15,8 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
   isPrimaryHost = true,
   onUploadMedia,
   onOpenLiveCamera,
+  onOpenQrModal,
+  qrQueueSnapshot,
   onSelectEvent,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -68,6 +72,7 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
   const isVideoFile = selectedFile
     ? /\.(mp4|mov|avi|webm|mkv)$/i.test(selectedFile.name)
     : false;
+  const isZipFile = selectedFile ? /\.zip$/i.test(selectedFile.name) : false;
 
   return (
     <section className="rounded-xl border border-slate-800/90 bg-[#0d1320] p-5 shadow-lg">
@@ -84,25 +89,49 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
       </div>
 
       {/* Mode Switch Buttons */}
-      <div className={`mb-4 grid gap-2 ${isPrimaryHost ? 'grid-cols-2' : 'grid-cols-1'}`}>
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          className="flex items-center justify-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/15 py-2.5 font-mono-tabular text-xs font-bold text-sky-300 transition hover:bg-sky-500/25 cursor-pointer"
-        >
-          <Upload className="h-3.5 w-3.5" />
-          {isPrimaryHost ? 'UPLOAD MEDIA' : 'UPLOAD MEDIA ONLY (REMOTE PC)'}
-        </button>
-        {isPrimaryHost && (
+      <div className="mb-3 flex flex-col gap-2">
+        <div className={`grid gap-2 ${isPrimaryHost ? 'grid-cols-2' : 'grid-cols-1'}`}>
           <button
             type="button"
-            onClick={onOpenLiveCamera}
-            className="flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 py-2.5 font-mono-tabular text-xs font-bold text-slate-200 transition hover:border-sky-400/50 hover:text-sky-300 cursor-pointer"
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center justify-center gap-2 rounded-lg border border-sky-500/40 bg-sky-500/15 py-2.5 font-mono-tabular text-xs font-bold text-sky-300 transition hover:bg-sky-500/25 cursor-pointer"
           >
-            <Camera className="h-3.5 w-3.5 text-sky-400" />
-            FULLSCREEN LIVE CAM
+            <Upload className="h-3.5 w-3.5" />
+            {isPrimaryHost ? 'UPLOAD MEDIA' : 'UPLOAD MEDIA ONLY (REMOTE PC)'}
           </button>
-        )}
+          {isPrimaryHost && (
+            <button
+              type="button"
+              onClick={onOpenLiveCamera}
+              className="flex items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-900 py-2.5 font-mono-tabular text-xs font-bold text-slate-200 transition hover:border-sky-400/50 hover:text-sky-300 cursor-pointer"
+            >
+              <Camera className="h-3.5 w-3.5 text-sky-400" />
+              FULLSCREEN LIVE CAM
+            </button>
+          )}
+        </div>
+
+        {/* QR Code Mobile Upload & Queue Button */}
+        <button
+          type="button"
+          onClick={onOpenQrModal}
+          className="flex w-full items-center justify-between rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-2.5 font-mono-tabular text-xs font-bold text-emerald-300 transition hover:border-emerald-400 hover:bg-emerald-500/20 cursor-pointer"
+        >
+          <span className="flex items-center gap-2">
+            <QrCode className="h-4 w-4 text-emerald-400" />
+            <span>QR CODE UPLOAD & AUTO-QUEUE</span>
+          </span>
+          {qrQueueSnapshot && qrQueueSnapshot.active_count > 0 ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/20 px-2 py-0.5 text-[10px] font-bold text-sky-300">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {qrQueueSnapshot.active_count} IN QUEUE
+            </span>
+          ) : (
+            <span className="rounded bg-emerald-500/20 px-2 py-0.5 text-[10px] text-emerald-300">
+              MULTI-USER
+            </span>
+          )}
+        </button>
       </div>
 
       <form onSubmit={handleScanSubmit}>
@@ -125,7 +154,7 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-msvideo,video/webm,video/x-matroska,.jpg,.jpeg,.png,.webp,.mp4,.mov,.avi,.webm,.mkv"
+            accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-msvideo,video/webm,video/x-matroska,application/zip,.jpg,.jpeg,.png,.webp,.mp4,.mov,.avi,.webm,.mkv,.zip"
             onChange={handleFileChange}
             className="hidden"
           />
@@ -142,7 +171,7 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
               </div>
               <div className="font-mono-tabular text-[11px] text-slate-400">
                 {(selectedFile.size / 1024).toFixed(1)} KB •{' '}
-                {isVideoFile ? 'VIDEO STREAM SCAN' : 'HIGH-RES FRAME SCAN'}
+                {isZipFile ? 'BATCH ZIP IMAGE SCAN' : isVideoFile ? 'VIDEO STREAM SCAN' : 'HIGH-RES FRAME SCAN'}
               </div>
             </div>
           ) : (
@@ -155,7 +184,7 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
                 Drop Picture or Video file here
               </div>
               <div className="font-mono-tabular text-[11px] text-slate-500">
-                Supports JPG, PNG, WEBP, MP4, MOV, AVI, WEBM
+                Supports JPG, PNG, WEBP, MP4, MOV, AVI, WEBM, ZIP
               </div>
             </div>
           )}
@@ -197,7 +226,9 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
             <>
               <Loader2 className="h-4 w-4 animate-spin" />
               <span>
-                {isVideoFile
+                {isZipFile
+                  ? 'BATCH SCANNING ZIP IMAGES...'
+                  : isVideoFile
                   ? 'ANALYZING VIDEO FRAMES & TIMELINE...'
                   : 'RUNNING DUAL-MODEL CASCADE...'}
               </span>

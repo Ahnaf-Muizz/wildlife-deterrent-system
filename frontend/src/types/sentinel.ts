@@ -97,3 +97,38 @@ export interface LiveDetectResponse {
   saved_event: DeterrentEventRecord | null;
   telemetry: DeterrentTelemetry;
 }
+
+export type QrJobStatus = 'queued' | 'processing' | 'completed' | 'failed';
+
+export interface QrQueueJob {
+  job_id: string;
+  original_name: string;
+  media_type: 'image' | 'video' | 'zip';
+  file_size_kb: number;
+  uploader: string;
+  status: QrJobStatus;
+  position: number;
+  queued_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  event: DeterrentEventRecord | null;
+  batch_count: number;
+  error: string | null;
+}
+
+export interface QrNetworkInfo {
+  ips: string[];
+  port: number;
+  primary_url: string;
+  urls: string[];
+}
+
+export interface QrQueueSnapshot {
+  queued_count: number;
+  processing_count: number;
+  active_count: number;
+  completed_count: number;
+  failed_count: number;
+  jobs: QrQueueJob[];
+  network: QrNetworkInfo;
+}

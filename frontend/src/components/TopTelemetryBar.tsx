@@ -12,6 +12,8 @@ import {
   Zap,
   Cpu,
   Wifi,
+  QrCode,
+  Loader2,
 } from 'lucide-react';
 import { DeterrentTelemetry, ModelStatusInfo } from '../types/sentinel';
 
@@ -21,9 +23,11 @@ interface TopTelemetryBarProps {
   isPrimaryHost?: boolean;
   isMuted: boolean;
   notificationPermission: NotificationPermission;
+  activeQueueCount?: number;
   onToggleMute: () => void;
   onRequestNotifications: () => void;
   onOpenLiveCamera: () => void;
+  onOpenQrModal: () => void;
   onStopAll: () => void;
 }
 
@@ -33,9 +37,11 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
   isPrimaryHost = true,
   isMuted,
   notificationPermission,
+  activeQueueCount = 0,
   onToggleMute,
   onRequestNotifications,
   onOpenLiveCamera,
+  onOpenQrModal,
   onStopAll,
 }) => {
   const progressPct =
@@ -187,6 +193,22 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
             aria-label={isMuted ? 'Unmute dashboard alert chime' : 'Mute dashboard alert chime'}
           >
             {isMuted ? <VolumeX className="h-4 w-4 text-rose-400" /> : <Volume2 className="h-4 w-4 text-sky-400" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenQrModal}
+            className="flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/15 px-3 py-2 font-mono-tabular text-xs font-bold tracking-wide text-emerald-300 transition hover:bg-emerald-500/25 cursor-pointer"
+            title="Open QR Code for Mobile Picture/Video Upload & Auto-Scan Queue"
+          >
+            <QrCode className="h-4 w-4 text-emerald-400" />
+            <span>QR UPLOAD</span>
+            {activeQueueCount > 0 && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-sky-500/30 px-1.5 py-0.5 text-[10px] font-bold text-sky-200">
+                <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                {activeQueueCount}
+              </span>
+            )}
           </button>
 
           {isPrimaryHost ? (

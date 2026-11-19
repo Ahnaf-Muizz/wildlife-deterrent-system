@@ -8,6 +8,7 @@ import glob
 import uuid
 import time
 import sqlite3
+import zipfile
 import cv2
 import numpy as np
 import random
@@ -15,6 +16,7 @@ import json
 import urllib.request
 import urllib.parse
 import threading
+import queue
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, redirect, url_for, Response
 from flask_sqlalchemy import SQLAlchemy
@@ -31,7 +33,7 @@ DB_V3_PATH = os.path.join(BASE_DIR, "sentinel_logs_v3.db")
 
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + DB_V4_PATH
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 512 * 1024 * 1024  # Support up to 512MB video uploads
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024  # Support up to 1024MB video/batch uploads
 app.config["UPLOAD_FOLDER"] = os.path.join(BASE_DIR, "uploads")
 app.config["RESULTS_FOLDER"] = os.path.join(BASE_DIR, "results_db")
 app.config["THUMBNAILS_FOLDER"] = os.path.join(BASE_DIR, "thumbnails_db")
@@ -1049,7 +1051,7 @@ def api_dashboard():
     if media_filter and media_filter != "all":
         query = query.filter_by(media_type=media_filter)
 
-    pagination = query.order_by(DeterrentEvent.timestamp.desc()).paginate(
+    pagination = query.order_by(DeterrentEvent.timestamp.desc(), DeterrentEvent.id.desc()).paginate(
         page=page, per_page=per_page, error_out=False
     )
 
@@ -1144,8 +1146,82 @@ def api_upload():
     image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
     video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
 
-    if ext not in image_exts and ext not in video_exts:
-        return jsonify({"error": f"Unsupported file format '{ext}'. Upload an image or video."}), 400
+    if ext not in image_exts and ext not in video_exts and ext != ".zip":
+        return jsonify({"error": f"Unsupported file format '{ext}'. Upload an image, video, or .zip image archive."}), 400
+
+    if ext == ".zip":
+        zip_path = os.path.join(app.config["UPLOAD_FOLDER"], f"batch_{uuid.uuid4().hex[:8]}.zip")
+        file.save(zip_path)
+        created_events = []
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                entries = sorted(
+                    [
+                        n for n in zf.namelist()
+                        if not n.endswith("/") and os.path.splitext(n)[1].lower() in image_exts
+                    ]
+                )
+                if not entries:
+                    return jsonify({"error": "ZIP archive contains no supported images."}), 400
+                for entry_name in entries:
+                    raw_bytes = zf.read(entry_name)
+                    if not raw_bytes:
+                        continue
+                    item_ext = os.path.splitext(entry_name)[1].lower()
+                    item_stem = f"scan_{uuid.uuid4().hex[:8]}"
+                    item_upload = os.path.join(app.config["UPLOAD_FOLDER"], f"{item_stem}{item_ext}")
+                    with open(item_upload, "wb") as out_f:
+                        out_f.write(raw_bytes)
+                    img_bgr = cv2.imread(item_upload)
+                    if img_bgr is None:
+                        continue
+                    h_img, w_img = img_bgr.shape[:2]
+                    detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
+                    annotated_bgr = draw_tactical_boxes(img_bgr, detections)
+                    plan = evaluate_deterrent_plan(detections)
+                    res_fname = f"{item_stem}.jpg"
+                    cv2.imwrite(
+                        os.path.join(app.config["RESULTS_FOLDER"], res_fname),
+                        annotated_bgr,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 93],
+                    )
+                    ev = DeterrentEvent(
+                        filename=res_fname,
+                        thumbnail_filename=None,
+                        media_type="image",
+                        primary_target=plan["primary_target"],
+                        action_taken=plan["action_taken"],
+                        actuators_json=json.dumps(plan["actuators"]),
+                        sound_duration_ms=plan["sound_duration_ms"],
+                        confidence=plan["max_confidence"],
+                        resolution=f"{w_img} x {h_img} px",
+                        file_size_kb=len(raw_bytes) / 1024.0,
+                        video_duration_sec=0.0,
+                        detections_json=json.dumps(detections),
+                        timeline_json="[]",
+                    )
+                    db.session.add(ev)
+                    db.session.flush()
+                    ev_dict = ev.to_dict()
+                    ev_dict["source_name"] = os.path.basename(entry_name)
+                    created_events.append(ev_dict)
+                db.session.commit()
+        finally:
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+
+        if not created_events:
+            return jsonify({"error": "No valid images could be decoded from the ZIP archive."}), 400
+        return jsonify({
+            "status": "success",
+            "batch": True,
+            "count": len(created_events),
+            "events": created_events,
+            "event": created_events[-1],
+            "telemetry": get_active_deterrent_telemetry(),
+        })
 
     unique_stem = f"scan_{uuid.uuid4().hex[:8]}"
     raw_filename = f"{unique_stem}{ext}"
@@ -1228,6 +1304,529 @@ def api_upload():
             "event": ev.to_dict(),
             "telemetry": get_active_deterrent_telemetry(),
         })
+
+
+# ==============================================================================
+# 100% OFFLINE QR CODE GENERATOR & MULTI-UPLOAD FIFO SCAN QUEUE
+# ==============================================================================
+
+_QR_EXP = [0] * 512
+_QR_LOG = [0] * 256
+_qr_x = 1
+for _i in range(255):
+    _QR_EXP[_i] = _qr_x
+    _QR_LOG[_qr_x] = _i
+    _qr_x <<= 1
+    if _qr_x & 0x100:
+        _qr_x ^= 0x11D
+for _i in range(255, 512):
+    _QR_EXP[_i] = _QR_EXP[_i - 255]
+
+_QR_VER_L = {
+    1: (19, 7, 1, []),
+    2: (34, 10, 1, [6, 18]),
+    3: (55, 15, 1, [6, 22]),
+    4: (80, 20, 1, [6, 26]),
+    5: (108, 26, 1, [6, 30]),
+    6: (136, 18, 2, [6, 34]),
+    7: (156, 20, 2, [6, 22, 38]),
+    8: (194, 24, 2, [6, 24, 42]),
+}
+_QR_FORMAT_BITS_L = [0x77C4, 0x72F3, 0x7DAA, 0x789D, 0x662F, 0x6318, 0x6C41, 0x6976]
+_QR_VERSION_BITS = {7: 0x07C94, 8: 0x085BC}
+
+
+def _qr_rs_encode(data, nsym):
+    gen = [1]
+    for i in range(nsym):
+        nxt = [0] * (len(gen) + 1)
+        for j, g in enumerate(gen):
+            nxt[j] ^= g
+            nxt[j + 1] ^= _QR_EXP[_QR_LOG[g] + i] if g else 0
+        gen = nxt
+    res = list(data) + [0] * nsym
+    for i in range(len(data)):
+        coef = res[i]
+        if coef != 0:
+            lcoef = _QR_LOG[coef]
+            for j in range(1, len(gen)):
+                if gen[j]:
+                    res[i + j] ^= _QR_EXP[lcoef + _QR_LOG[gen[j]]]
+    return res[len(data):]
+
+
+def _make_qr_matrix(text: str):
+    raw = text.encode("utf-8")[:190]
+    ver = next((v for v, (dc, _, _, _) in _QR_VER_L.items() if len(raw) + 2 <= dc), 8)
+    dc, ec_per_blk, nblk, align = _QR_VER_L[ver]
+    bits = [0, 1, 0, 0]
+    for i in range(7, -1, -1):
+        bits.append((len(raw) >> i) & 1)
+    for b in raw:
+        for i in range(7, -1, -1):
+            bits.append((b >> i) & 1)
+    for _ in range(min(4, dc * 8 - len(bits))):
+        bits.append(0)
+    while len(bits) % 8 != 0:
+        bits.append(0)
+    codewords = [sum(bits[i + j] << (7 - j) for j in range(8)) for i in range(0, len(bits), 8)]
+    pad_bytes = [0xEC, 0x11]
+    while len(codewords) < dc:
+        codewords.append(pad_bytes[len(codewords) % 2])
+
+    blk_size = dc // nblk
+    data_blks, ec_blks = [], []
+    for b in range(nblk):
+        blk = codewords[b * blk_size:(b + 1) * blk_size]
+        data_blks.append(blk)
+        ec_blks.append(_qr_rs_encode(blk, ec_per_blk))
+    final_cw = (
+        [data_blks[b][i] for i in range(blk_size) for b in range(nblk)]
+        + [ec_blks[b][i] for i in range(ec_per_blk) for b in range(nblk)]
+    )
+    final_bits = [(cw >> i) & 1 for cw in final_cw for i in range(7, -1, -1)]
+
+    size = 17 + 4 * ver
+    mat = [[0] * size for _ in range(size)]
+    is_func = [[False] * size for _ in range(size)]
+
+    def set_func(r, c, val):
+        if 0 <= r < size and 0 <= c < size:
+            mat[r][c] = 1 if val else 0
+            is_func[r][c] = True
+
+    def place_finder(top, left):
+        for dr in range(-1, 8):
+            for dc_ in range(-1, 8):
+                val = (
+                    0 <= dr <= 6
+                    and 0 <= dc_ <= 6
+                    and (dr in (0, 6) or dc_ in (0, 6) or (2 <= dr <= 4 and 2 <= dc_ <= 4))
+                )
+                set_func(top + dr, left + dc_, val)
+
+    place_finder(0, 0)
+    place_finder(0, size - 7)
+    place_finder(size - 7, 0)
+
+    for i in range(8, size - 8):
+        set_func(6, i, i % 2 == 0)
+        set_func(i, 6, i % 2 == 0)
+
+    for ar in align:
+        for ac in align:
+            if (ar == 6 and ac == 6) or (ar == 6 and ac == size - 7) or (ar == size - 7 and ac == 6):
+                continue
+            for dr in range(-2, 3):
+                for dc_ in range(-2, 3):
+                    set_func(ar + dr, ac + dc_, max(abs(dr), abs(dc_)) != 1)
+
+    for i in range(9):
+        if i != 6:
+            set_func(8, i, False)
+            set_func(i, 8, False)
+    for i in range(8):
+        set_func(8, size - 1 - i, False)
+        set_func(size - 1 - i, 8, False)
+    set_func(size - 8, 8, True)
+
+    if ver in _QR_VERSION_BITS:
+        vb = _QR_VERSION_BITS[ver]
+        for i in range(18):
+            bit = ((vb >> i) & 1) == 1
+            set_func(size - 11 + (i % 3), i // 3, bit)
+            set_func(i // 3, size - 11 + (i % 3), bit)
+
+    bit_idx = 0
+    up = True
+    col = size - 1
+    while col > 0:
+        if col == 6:
+            col -= 1
+        rows = range(size - 1, -1, -1) if up else range(size)
+        for r in rows:
+            for c in (col, col - 1):
+                if not is_func[r][c]:
+                    if bit_idx < len(final_bits):
+                        mat[r][c] = final_bits[bit_idx]
+                        bit_idx += 1
+        up = not up
+        col -= 2
+
+    for r in range(size):
+        for c in range(size):
+            if not is_func[r][c] and (r + c) % 2 == 0:
+                mat[r][c] ^= 1
+
+    fb = _QR_FORMAT_BITS_L[0]
+    f_coords1 = [
+        (8, 0), (8, 1), (8, 2), (8, 3), (8, 4), (8, 5), (8, 7), (8, 8),
+        (7, 8), (5, 8), (4, 8), (3, 8), (2, 8), (1, 8), (0, 8),
+    ]
+    for i, (r, c) in enumerate(f_coords1):
+        mat[r][c] = (fb >> (14 - i)) & 1
+    for i in range(7):
+        mat[size - 1 - i][8] = (fb >> (14 - i)) & 1
+    for i in range(8):
+        mat[8][size - 8 + i] = (fb >> (7 - i)) & 1
+
+    return mat
+
+
+def generate_qr_svg(text: str, quiet: int = 4) -> str:
+    mat = _make_qr_matrix(text)
+    n = len(mat)
+    total = n + quiet * 2
+    rects = []
+    for r in range(n):
+        for c in range(n):
+            if mat[r][c]:
+                rects.append(f'<rect x="{c + quiet}" y="{r + quiet}" width="1" height="1"/>')
+    body = "".join(rects)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total} {total}" '
+        f'shape-rendering="crispEdges" width="280" height="280">'
+        f'<rect width="{total}" height="{total}" fill="#ffffff" rx="1.5"/>'
+        f'<g fill="#080c14">{body}</g></svg>'
+    )
+
+
+_qr_upload_queue: "queue.Queue[str]" = queue.Queue()
+_qr_jobs_lock = threading.Lock()
+_qr_jobs: dict[str, dict] = {}
+_qr_job_order: list[str] = []
+
+
+def _process_single_queued_job(job_id: str):
+    with _qr_jobs_lock:
+        job = _qr_jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "processing"
+        job["started_at"] = datetime.now().strftime("%H:%M:%S")
+        upload_path = job["saved_upload_path"]
+        ext = job["ext"]
+        conf_thresh = job["conf_thresh"]
+        unique_stem = job["unique_stem"]
+        file_size_kb = job["file_size_kb"]
+
+    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+
+    try:
+        with app.app_context():
+            if ext in image_exts:
+                img_bgr = cv2.imread(upload_path)
+                if img_bgr is None:
+                    raise RuntimeError("Failed to decode uploaded image.")
+                h_img, w_img = img_bgr.shape[:2]
+                resolution = f"{w_img} x {h_img} px"
+                detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
+                annotated_bgr = draw_tactical_boxes(img_bgr, detections)
+                plan = evaluate_deterrent_plan(detections)
+
+                result_filename = f"{unique_stem}.jpg"
+                result_path = os.path.join(app.config["RESULTS_FOLDER"], result_filename)
+                cv2.imwrite(result_path, annotated_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
+
+                sync_deterrents_with_plan(plan)
+
+                ev = DeterrentEvent(
+                    filename=result_filename,
+                    thumbnail_filename=None,
+                    media_type="image",
+                    primary_target=plan["primary_target"],
+                    action_taken=plan["action_taken"],
+                    actuators_json=json.dumps(plan["actuators"]),
+                    sound_duration_ms=plan["sound_duration_ms"],
+                    confidence=plan["max_confidence"],
+                    resolution=resolution,
+                    file_size_kb=file_size_kb,
+                    video_duration_sec=0.0,
+                    detections_json=json.dumps(detections),
+                    timeline_json="[]",
+                )
+                db.session.add(ev)
+                db.session.commit()
+                ev_dict = ev.to_dict()
+
+                with _qr_jobs_lock:
+                    job["status"] = "completed"
+                    job["completed_at"] = datetime.now().strftime("%H:%M:%S")
+                    job["event"] = ev_dict
+                    job["batch_count"] = 1
+
+            elif ext in video_exts:
+                vid_info = process_uploaded_video(upload_path, unique_stem, conf_thresh=conf_thresh)
+                plan = vid_info["plan"]
+                sync_deterrents_with_plan(plan)
+
+                ev = DeterrentEvent(
+                    filename=vid_info["out_filename"],
+                    thumbnail_filename=vid_info["thumb_filename"],
+                    media_type="video",
+                    primary_target=plan["primary_target"],
+                    action_taken=plan["action_taken"],
+                    actuators_json=json.dumps(plan["actuators"]),
+                    sound_duration_ms=plan["sound_duration_ms"],
+                    confidence=plan["max_confidence"],
+                    resolution=vid_info["resolution"],
+                    file_size_kb=file_size_kb,
+                    video_duration_sec=vid_info["duration_sec"],
+                    detections_json=json.dumps(vid_info["sample_detections"]),
+                    timeline_json=json.dumps(vid_info["timeline"]),
+                )
+                db.session.add(ev)
+                db.session.commit()
+                ev_dict = ev.to_dict()
+
+                with _qr_jobs_lock:
+                    job["status"] = "completed"
+                    job["completed_at"] = datetime.now().strftime("%H:%M:%S")
+                    job["event"] = ev_dict
+                    job["batch_count"] = 1
+
+            elif ext == ".zip":
+                created_events = []
+                try:
+                    with zipfile.ZipFile(upload_path, "r") as zf:
+                        entries = sorted(
+                            [
+                                n for n in zf.namelist()
+                                if not n.endswith("/") and os.path.splitext(n)[1].lower() in image_exts
+                            ]
+                        )
+                        if not entries:
+                            raise RuntimeError("ZIP archive contains no supported images.")
+                        for entry_name in entries:
+                            raw_bytes = zf.read(entry_name)
+                            if not raw_bytes:
+                                continue
+                            item_ext = os.path.splitext(entry_name)[1].lower()
+                            item_stem = f"scan_{uuid.uuid4().hex[:8]}"
+                            item_upload = os.path.join(app.config["UPLOAD_FOLDER"], f"{item_stem}{item_ext}")
+                            with open(item_upload, "wb") as out_f:
+                                out_f.write(raw_bytes)
+                            img_bgr = cv2.imread(item_upload)
+                            if img_bgr is None:
+                                continue
+                            h_img, w_img = img_bgr.shape[:2]
+                            detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
+                            annotated_bgr = draw_tactical_boxes(img_bgr, detections)
+                            plan = evaluate_deterrent_plan(detections)
+                            res_fname = f"{item_stem}.jpg"
+                            cv2.imwrite(
+                                os.path.join(app.config["RESULTS_FOLDER"], res_fname),
+                                annotated_bgr,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), 93],
+                            )
+                            ev = DeterrentEvent(
+                                filename=res_fname,
+                                thumbnail_filename=None,
+                                media_type="image",
+                                primary_target=plan["primary_target"],
+                                action_taken=plan["action_taken"],
+                                actuators_json=json.dumps(plan["actuators"]),
+                                sound_duration_ms=plan["sound_duration_ms"],
+                                confidence=plan["max_confidence"],
+                                resolution=f"{w_img} x {h_img} px",
+                                file_size_kb=len(raw_bytes) / 1024.0,
+                                video_duration_sec=0.0,
+                                detections_json=json.dumps(detections),
+                                timeline_json="[]",
+                            )
+                            db.session.add(ev)
+                            db.session.flush()
+                            created_events.append(ev.to_dict())
+                        db.session.commit()
+                finally:
+                    try:
+                        os.remove(upload_path)
+                    except Exception:
+                        pass
+
+                if not created_events:
+                    raise RuntimeError("No valid images could be decoded from ZIP.")
+                with _qr_jobs_lock:
+                    job["status"] = "completed"
+                    job["completed_at"] = datetime.now().strftime("%H:%M:%S")
+                    job["event"] = created_events[-1]
+                    job["batch_count"] = len(created_events)
+    except Exception as err:
+        with _qr_jobs_lock:
+            job["status"] = "failed"
+            job["completed_at"] = datetime.now().strftime("%H:%M:%S")
+            job["error"] = str(err)
+
+
+def _qr_queue_worker():
+    while True:
+        job_id = _qr_upload_queue.get()
+        try:
+            _process_single_queued_job(job_id)
+        except Exception as e:
+            print(f"[QR-QUEUE] Worker error on {job_id}: {e}")
+        finally:
+            _qr_upload_queue.task_done()
+
+
+_qr_worker_thread = threading.Thread(target=_qr_queue_worker, daemon=True)
+_qr_worker_thread.start()
+
+
+def get_qr_queue_snapshot() -> dict:
+    lan_ips = _get_local_ipv4_addresses()
+    if not lan_ips:
+        lan_ips = ["192.168.4.2"]
+    urls = [f"http://{ip}:5002/qr-upload" for ip in lan_ips]
+    primary_url = urls[0]
+
+    with _qr_jobs_lock:
+        queued_ids = [jid for jid in _qr_job_order if _qr_jobs.get(jid, {}).get("status") == "queued"]
+        pos_map = {jid: idx + 1 for idx, jid in enumerate(queued_ids)}
+
+        queued_count = len(queued_ids)
+        processing_count = sum(1 for jid in _qr_job_order if _qr_jobs.get(jid, {}).get("status") == "processing")
+        completed_count = sum(1 for jid in _qr_job_order if _qr_jobs.get(jid, {}).get("status") == "completed")
+        failed_count = sum(1 for jid in _qr_job_order if _qr_jobs.get(jid, {}).get("status") == "failed")
+
+        recent_ids = list(reversed(_qr_job_order[-40:]))
+        jobs_list = []
+        for jid in recent_ids:
+            j = _qr_jobs.get(jid)
+            if not j:
+                continue
+            jobs_list.append({
+                "job_id": j["job_id"],
+                "original_name": j["original_name"],
+                "media_type": j["media_type"],
+                "file_size_kb": j["file_size_kb"],
+                "uploader": j["uploader"],
+                "status": j["status"],
+                "position": pos_map.get(jid, 0),
+                "queued_at": j["queued_at"],
+                "started_at": j["started_at"],
+                "completed_at": j["completed_at"],
+                "event": j["event"],
+                "batch_count": j["batch_count"],
+                "error": j["error"],
+            })
+
+    return {
+        "queued_count": queued_count,
+        "processing_count": processing_count,
+        "active_count": queued_count + processing_count,
+        "completed_count": completed_count,
+        "failed_count": failed_count,
+        "jobs": jobs_list,
+        "network": {
+            "ips": lan_ips,
+            "port": 5002,
+            "primary_url": primary_url,
+            "urls": urls,
+        },
+    }
+
+
+@app.route("/api/qr/svg", methods=["GET"])
+def api_qr_svg():
+    target_url = request.args.get("url", "").strip()
+    if not target_url:
+        snap = get_qr_queue_snapshot()
+        target_url = snap["network"]["primary_url"]
+    svg_str = generate_qr_svg(target_url)
+    resp = Response(svg_str, mimetype="image/svg+xml")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
+@app.route("/api/qr/queue", methods=["GET"])
+def api_qr_queue_status():
+    return jsonify(get_qr_queue_snapshot())
+
+
+@app.route("/api/qr/queue/clear", methods=["POST"])
+def api_qr_queue_clear():
+    with _qr_jobs_lock:
+        active_ids = [
+            jid for jid in _qr_job_order
+            if _qr_jobs.get(jid, {}).get("status") in ("queued", "processing")
+        ]
+        _qr_job_order[:] = active_ids
+        for jid in list(_qr_jobs.keys()):
+            if jid not in active_ids:
+                _qr_jobs.pop(jid, None)
+    return jsonify(get_qr_queue_snapshot())
+
+
+@app.route("/api/qr/enqueue", methods=["POST"])
+def api_qr_enqueue():
+    uploaded_files = request.files.getlist("files")
+    if not uploaded_files and "file" in request.files:
+        uploaded_files = [request.files["file"]]
+
+    valid_files = [f for f in uploaded_files if f and f.filename]
+    if not valid_files:
+        return jsonify({"error": "No media files provided."}), 400
+
+    conf_thresh = max(0.50, float(request.form.get("conf", 0.50)))
+    uploader = (request.form.get("uploader") or "Mobile QR Upload").strip()[:48]
+
+    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+    allowed_exts = image_exts | video_exts | {".zip"}
+
+    enqueued_jobs = []
+    for f in valid_files:
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in allowed_exts:
+            continue
+        unique_stem = f"scan_{uuid.uuid4().hex[:8]}"
+        raw_filename = f"{unique_stem}{ext}"
+        upload_path = os.path.join(app.config["UPLOAD_FOLDER"], raw_filename)
+        f.save(upload_path)
+        file_size_kb = os.path.getsize(upload_path) / 1024.0
+        job_id = f"q_{uuid.uuid4().hex[:8]}"
+        media_type = "video" if ext in video_exts else ("zip" if ext == ".zip" else "image")
+
+        job_entry = {
+            "job_id": job_id,
+            "unique_stem": unique_stem,
+            "original_name": os.path.basename(f.filename),
+            "saved_upload_path": upload_path,
+            "ext": ext,
+            "media_type": media_type,
+            "file_size_kb": round(file_size_kb, 1),
+            "conf_thresh": conf_thresh,
+            "uploader": uploader,
+            "status": "queued",
+            "queued_at": datetime.now().strftime("%H:%M:%S"),
+            "started_at": None,
+            "completed_at": None,
+            "event": None,
+            "batch_count": 0,
+            "error": None,
+        }
+        with _qr_jobs_lock:
+            _qr_jobs[job_id] = job_entry
+            _qr_job_order.append(job_id)
+        _qr_upload_queue.put(job_id)
+        enqueued_jobs.append({
+            "job_id": job_id,
+            "original_name": job_entry["original_name"],
+            "media_type": media_type,
+            "status": "queued",
+        })
+
+    if not enqueued_jobs:
+        return jsonify({"error": "No supported image, video, or .zip files found in upload."}), 400
+
+    return jsonify({
+        "status": "queued",
+        "enqueued_count": len(enqueued_jobs),
+        "enqueued": enqueued_jobs,
+        "queue": get_qr_queue_snapshot(),
+    })
 
 
 @app.route("/api/deterrent/video_sync", methods=["POST"])
@@ -1804,6 +2403,16 @@ def serve_thumbnail(filename):
     return response
 
 
+@app.route("/qr-upload")
+def serve_qr_upload():
+    return serve_spa("")
+
+
+@app.route("/mobile-upload")
+def serve_mobile_upload():
+    return serve_spa("")
+
+
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_spa(path):
@@ -1824,6 +2433,13 @@ def serve_spa(path):
         "<h3>Sentinel Frontend Build Not Found</h3><p>Run <code>npm run build</code> inside <code>Wildlife Deterrent System/frontend</code>.</p>",
         503,
     )
+
+
+@app.errorhandler(404)
+def handle_spa_404(err):
+    if request.path.startswith("/api/") or request.path.startswith("/results/") or request.path.startswith("/thumbnails/"):
+        return jsonify({"error": "Not found"}), 404
+    return serve_spa("")
 
 
 def _get_local_ipv4_addresses() -> list[str]:
