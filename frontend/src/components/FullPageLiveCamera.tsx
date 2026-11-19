@@ -85,6 +85,15 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
   const startCameraStream = useCallback(
     async (_deviceId?: string) => {
       setCameraError(null);
+      try {
+        await fetch('/api/camera/control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rotation: 180 }),
+        });
+      } catch {
+        // Ignore control sync error and continue starting stream
+      }
       if (videoRef.current) {
         videoRef.current.src = `/api/camera/stream?t=${Date.now()}`;
       }

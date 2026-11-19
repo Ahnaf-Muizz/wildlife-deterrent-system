@@ -2160,7 +2160,7 @@ _global_awb = DashboardGrayWorldAWB()
 _camera_state = {
     "mirror_h": True,
     "mirror_v": False,
-    "rotation": 0,
+    "rotation": 180,
     "awb": True,
     "sensor_id": int(os.environ.get("CSI_SENSOR_ID", "0")),
     "flip_method": int(os.environ.get("CSI_FLIP_METHOD", "0")),
@@ -2444,25 +2444,107 @@ def handle_spa_404(err):
 
 def _get_local_ipv4_addresses() -> list[str]:
     ips: list[str] = []
+    ignore_ifaces = ("lo", "docker", "l4tbr", "br-", "veth", "virbr", "tun", "tap")
+    ignore_prefixes = ("127.", "192.168.55.", "172.17.", "169.254.")
+
+    def _add_ip(ip: str, front: bool = False):
+        if not ip or any(ip.startswith(p) for p in ignore_prefixes):
+            return
+        if ip in ips:
+            if front:
+                ips.remove(ip)
+                ips.insert(0, ip)
+            return
+        if front:
+            ips.insert(0, ip)
+        else:
+            ips.append(ip)
+
     try:
-        import socket
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if ip and not ip.startswith("127.") and ip not in ips:
-                ips.append(ip)
+        import subprocess
+        out = subprocess.check_output(
+            ["ip", "-4", "-o", "addr", "show", "up", "scope", "global"],
+            text=True,
+            timeout=1.0,
+        )
+        wifi_ips: list[str] = []
+        other_ips: list[str] = []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            iface = parts[1]
+            if any(iface.startswith(p) for p in ignore_ifaces):
+                continue
+            ip = parts[3].split("/")[0]
+            if any(ip.startswith(p) for p in ignore_prefixes):
+                continue
+            if ip.startswith("192.168.4."):
+                _add_ip(ip, front=True)
+            elif iface.startswith(("wl", "wlan", "wifi")):
+                wifi_ips.append(ip)
+            else:
+                other_ips.append(ip)
+        for ip in wifi_ips + other_ips:
+            _add_ip(ip, front=False)
     except Exception:
         pass
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("192.168.4.1", 80))
-        ap_ip = s.getsockname()[0]
-        s.close()
-        if ap_ip and not ap_ip.startswith("127.") and ap_ip not in ips:
-            ips.insert(0, ap_ip)
-    except Exception:
-        pass
+
+    for probe_target in (("192.168.4.1", 80), ("8.8.8.8", 80)):
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(probe_target)
+            routed_ip = s.getsockname()[0]
+            s.close()
+            is_esp_subnet = routed_ip.startswith("192.168.4.")
+            _add_ip(routed_ip, front=(is_esp_subnet or len(ips) == 0))
+        except Exception:
+            pass
+
+    if not ips:
+        try:
+            import socket
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                _add_ip(info[4][0], front=False)
+        except Exception:
+            pass
+
     return ips
+
+
+def _esp32_subnet_arp_warmer():
+    """
+    When connected to the ESP32 SoftAP (192.168.4.0/24), proactively probes
+    192.168.4.2..192.168.4.10 every 1.5s so mobile phones connected to the
+    ESP32 AP immediately cache the Jetson's MAC address in their ARP table
+    without relying on 802.11 broadcast ARP frames across DTIM sleep.
+    """
+    import socket
+    while True:
+        try:
+            lan_ips = _get_local_ipv4_addresses()
+            ap_ips = [ip for ip in lan_ips if ip.startswith("192.168.4.")]
+            if ap_ips:
+                my_ip = ap_ips[0]
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setblocking(False)
+                for host_id in range(1, 12):
+                    peer_ip = f"192.168.4.{host_id}"
+                    if peer_ip == my_ip:
+                        continue
+                    try:
+                        s.sendto(b"", (peer_ip, 5002))
+                    except Exception:
+                        pass
+                s.close()
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+
+_arp_warmer_thread = threading.Thread(target=_esp32_subnet_arp_warmer, daemon=True)
+_arp_warmer_thread.start()
 
 
 if __name__ == "__main__":

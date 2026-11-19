@@ -34,6 +34,7 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
   onSelectEvent,
 }) => {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const lastPrimaryIpRef = useRef<string>('');
   const titleId = useId();
   const multiInputId = useId();
   const hostInputId = useId();
@@ -44,8 +45,15 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
   const [uploadError, setUploadError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedIp && queueSnapshot.network.ips.length > 0) {
-      setSelectedIp(queueSnapshot.network.ips[0]);
+    const primaryIp = queueSnapshot.network.ips[0] || '';
+    if (!primaryIp) return;
+    if (
+      !selectedIp ||
+      primaryIp !== lastPrimaryIpRef.current ||
+      !queueSnapshot.network.ips.includes(selectedIp)
+    ) {
+      setSelectedIp(primaryIp);
+      lastPrimaryIpRef.current = primaryIp;
     }
   }, [queueSnapshot.network.ips, selectedIp]);
 

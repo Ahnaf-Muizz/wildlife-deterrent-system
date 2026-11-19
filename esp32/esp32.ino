@@ -13,7 +13,10 @@ const char* AP_SSID = "Wildlife-Deterrent-System-AP";
 const char* AP_PASS = "haustein26";
 
 IPAddress local_IP(192, 168, 4, 1);
-IPAddress gateway(192, 168, 4, 1);
+// Gateway 0.0.0.0 tells iOS/Android via DHCP Option 3 that this SoftAP is a
+// local-only LAN (no internet gateway), preventing mobile phones from routing
+// 192.168.4.x HTTP traffic over 5G/LTE cellular data.
+IPAddress gateway(0, 0, 0, 0);
 IPAddress subnet(255, 255, 255, 0);
 
 WebServer server(80);

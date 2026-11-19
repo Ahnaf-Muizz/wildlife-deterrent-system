@@ -159,6 +159,9 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (isMobileQrRoute) return;
     if (!isQrModalOpen && qrQueueSnapshot.active_count === 0) return;
+    if (isQrModalOpen) {
+      fetchQrQueue();
+    }
     const fastTimer = window.setInterval(() => {
       fetchQrQueue();
     }, 1200);
