@@ -59,7 +59,7 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
             <Shield className="h-5 w-5" />
           </div>
           <div className="flex items-center gap-2.5">
-            <h1 className="font-mono-tabular text-sm font-bold tracking-wide text-white">
+            <h1 className="font-mono-tabular text-lg font-bold tracking-wide text-white">
               Wildlife Deterrent System | ECE 3332: Microcontroller Project Lab | Group 8
             </h1>
           </div>

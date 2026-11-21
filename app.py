@@ -4,6 +4,7 @@ import os
 os.environ["YOLO_OFFLINE"] = "true"
 os.environ["ULTRALYTICS_OFFLINE"] = "1"
 
+import gc
 import glob
 import math
 import uuid
@@ -554,7 +555,7 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.50):
     conf_thresh = max(0.50, float(conf_thresh))
     h_img, w_img = img_bgr.shape[:2]
 
-    with _inference_lock:
+    with _inference_lock, torch.inference_mode():
         primary_res = primary_model.predict(
             source=img_bgr,
             save=False,
@@ -703,6 +704,13 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.50):
                         final_detections.append(det)
                 if final_detections:
                     break
+
+    _cleanup_counter = getattr(run_dual_model_cascade, "_calls", 0) + 1
+    run_dual_model_cascade._calls = _cleanup_counter
+    if _cleanup_counter % 25 == 0:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return deduplicate_detections(final_detections)
 
@@ -2402,6 +2410,7 @@ def api_live_detect():
     immediately when no 'SAFE' is detected and an animal is detected.
     """
     save_snapshot = request.form.get("save_snapshot", "false").lower() == "true"
+    auto_save = request.form.get("auto_save", "false").lower() == "true"
     auto_trigger = request.form.get("auto_trigger", "true").lower() == "true"
     conf_thresh = _safe_float(request.form.get("conf", 0.50), 0.50, min_v=0.50, max_v=0.99)
     use_csi = request.form.get("use_csi", "false").lower() == "true"
@@ -2495,7 +2504,10 @@ def api_live_detect():
         triggered_now = sync_deterrents_with_plan(plan)
 
     saved_event_dict = None
-    if save_snapshot:
+    should_save_snapshot = save_snapshot and (
+        not auto_save or plan["primary_target"] in ("BIRD", "SMALL MAMMAL", "LARGE MAMMAL")
+    )
+    if should_save_snapshot:
         unique_stem = f"live_{uuid.uuid4().hex[:8]}"
         result_filename = f"{unique_stem}.jpg"
         result_path = os.path.join(app.config["RESULTS_FOLDER"], result_filename)

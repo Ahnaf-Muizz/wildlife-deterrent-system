@@ -50,7 +50,7 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
   const retryTimerRef = useRef<number | null>(null);
 
   const [confThreshold, setConfThreshold] = useState<number>(0.5);
-  const [autoSaveOnThreat, setAutoSaveOnThreat] = useState<boolean>(false);
+  const [autoSaveOnThreat, setAutoSaveOnThreat] = useState<boolean>(true);
   const [autoTriggerEsp32, setAutoTriggerEsp32] = useState<boolean>(true);
   const [detections, setDetections] = useState<DetectionBox[]>([]);
   const [primaryTarget, setPrimaryTarget] = useState<ThreatCategory>('None');
@@ -138,11 +138,20 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
       setDetections([]);
       setPrimaryTarget('None');
       setHudNotice(null);
+      setSnapshotToast(null);
     }
     return () => {
       stopCameraStream();
     };
   }, [isOpen, startCameraStream, stopCameraStream]);
+
+  useEffect(() => {
+    if (!snapshotToast) return;
+    const t = window.setTimeout(() => {
+      setSnapshotToast(null);
+    }, 3500);
+    return () => window.clearTimeout(t);
+  }, [snapshotToast]);
 
   // Draw tactical bounding boxes & non-overlapping telemetry labels onto the live full-screen <canvas>
   const drawOverlay = useCallback(
@@ -273,7 +282,7 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
 
   // Send frame to backend /api/live/detect
   const sendFrameForDetection = useCallback(
-    async (saveSnapshot = false) => {
+    async (saveSnapshot = false, isAutoSave = false) => {
       if (!isOpenRef.current) return;
       const video = videoRef.current;
       if (!video) return;
@@ -292,6 +301,7 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
         formData.append('conf', String(confThreshold));
         formData.append('auto_trigger', String(autoTriggerEsp32));
         formData.append('save_snapshot', String(saveSnapshot));
+        formData.append('auto_save', String(isAutoSave));
 
         const res = await fetch('/api/live/detect', {
           method: 'POST',
@@ -336,13 +346,14 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
         } else if (
           !saveSnapshot &&
           autoSaveOnThreat &&
-          data.primary_target !== 'None' &&
-          data.primary_target !== 'SAFE' &&
+          (data.primary_target === 'BIRD' ||
+            data.primary_target === 'SMALL MAMMAL' ||
+            data.primary_target === 'LARGE MAMMAL') &&
           Date.now() - lastAutoSaveEpochRef.current > 6500
         ) {
           lastAutoSaveEpochRef.current = Date.now();
           inFlightRef.current = false;
-          await sendFrameForDetection(true);
+          await sendFrameForDetection(true, true);
         }
       } catch {
         // Ignore transient frame errors

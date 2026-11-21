@@ -184,9 +184,10 @@ export const App: React.FC = () => {
     void fetchDashboard();
     void fetchQrQueue();
     const syncTimer = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       void fetchDashboard();
       void fetchQrQueue();
-    }, 3500);
+    }, 8000);
     return () => {
       clearInterval(syncTimer);
       dashboardAbortRef.current?.abort();
