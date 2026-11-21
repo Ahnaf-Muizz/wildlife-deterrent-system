@@ -334,6 +334,7 @@ def main():
     fps_count = 0
     fps_time = time.time()
     current_fps = 0.0
+    has_display = bool(os.environ.get("DISPLAY")) and not args.headless
 
     while True:
         ret, frame = cap.read()
@@ -399,8 +400,6 @@ def main():
                     1,
                     cv2.LINE_AA,
                 )
-
-        has_display = bool(os.environ.get("DISPLAY")) and not args.headless
 
         if has_display:
             cv2.imshow("Jetson IMX219 Control - OpenCV", display_frame)

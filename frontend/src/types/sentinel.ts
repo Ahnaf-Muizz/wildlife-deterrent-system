@@ -63,9 +63,11 @@ export interface PaginationInfo {
 export interface DeterrentTelemetry {
   esp32_online: boolean;
   esp32_ip: string;
+  esp32_firmware?: string;
   is_active: boolean;
   last_target: string;
   active_actuators: ActuatorType[];
+  channels?: Record<ActuatorType, number>;
   duration_ms: number;
   remaining_ms: number;
 }
@@ -118,9 +120,13 @@ export interface QrQueueJob {
 
 export interface QrNetworkInfo {
   ips: string[];
+  on_esp32_ap?: boolean;
   port: number;
   primary_url: string;
   urls: string[];
+  wifi_ssid?: string;
+  wifi_password?: string;
+  wifi_qr_payload?: string;
 }
 
 export interface QrQueueSnapshot {

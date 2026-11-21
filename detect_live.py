@@ -25,12 +25,15 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+import importlib.util
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 device = 0 if torch.cuda.is_available() else "cpu"
+_has_tensorrt = importlib.util.find_spec("tensorrt") is not None
 
-# 1. Load Primary Custom 4-Class Model (Prefers TensorRT best.engine, falls back to best.pt)
-model_path = os.path.join(BASE_DIR, "best.engine")
-if not os.path.exists(model_path):
+# 1. Load Primary Custom 4-Class Model (Prefers TensorRT best.engine when TensorRT is installed, falls back to best.pt)
+model_path = os.path.join(BASE_DIR, "best.engine") if _has_tensorrt else ""
+if not model_path or not os.path.exists(model_path):
     model_path = os.path.join(BASE_DIR, "best.pt")
 
 print(f"[AI] Loading Primary 4-Class Model (OFFLINE): {model_path} on device: {device}...")
@@ -38,7 +41,10 @@ primary_model = YOLO(model_path)
 
 # 2. Load Secondary Prebuilt COCO Model (yolo11n.pt) strictly from local disk
 coco_verifier = None
-for cc in [os.path.join(BASE_DIR, "yolo11n.engine"), os.path.join(BASE_DIR, "yolo11n.pt")]:
+coco_cands = [os.path.join(BASE_DIR, "yolo11n.pt")]
+if _has_tensorrt:
+    coco_cands.insert(0, os.path.join(BASE_DIR, "yolo11n.engine"))
+for cc in coco_cands:
     if os.path.exists(cc):
         try:
             coco_verifier = YOLO(cc)
@@ -93,43 +99,95 @@ def compute_iou(box_a, box_b):
     return inter_area / float(area_a + area_b - inter_area)
 
 
-def verify_crop_with_coco(img_bgr, xyxy):
+def compute_iomin(box_a, box_b):
+    x_a = max(box_a[0], box_b[0])
+    y_a = max(box_a[1], box_b[1])
+    x_b = min(box_a[2], box_b[2])
+    y_b = min(box_a[3], box_b[3])
+    inter_w = max(0.0, x_b - x_a)
+    inter_h = max(0.0, y_b - y_a)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(1.0, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
+    area_b = max(1.0, (box_b[2] - box_b[0]) * (box_b[3] - box_b[1]))
+    return inter_area / float(min(area_a, area_b))
+
+
+def deduplicate_detections(detections, iou_thresh=0.45, iomin_thresh=0.78):
+    if len(detections) <= 1:
+        return list(detections)
+    ordered = sorted(
+        detections,
+        key=lambda d: (0 if d["class_id"] == 3 else 1, -float(d["confidence"])),
+    )
+    kept = []
+    for det in ordered:
+        det_area = max(1.0, (det["bbox"][2] - det["bbox"][0]) * (det["bbox"][3] - det["bbox"][1]))
+        suppressed = False
+        for i, prev in enumerate(kept):
+            if compute_iou(det["bbox"], prev["bbox"]) >= iou_thresh:
+                suppressed = True
+                break
+            if compute_iomin(det["bbox"], prev["bbox"]) >= iomin_thresh:
+                if prev["class_id"] in (0, 1, 2) and det["class_id"] in (0, 1, 2):
+                    prev_area = max(1.0, (prev["bbox"][2] - prev["bbox"][0]) * (prev["bbox"][3] - prev["bbox"][1]))
+                    if det_area < 0.65 * prev_area and float(det["confidence"]) >= float(prev["confidence"]) - 0.08:
+                        kept[i] = det
+                    suppressed = True
+                    break
+                if prev["class_id"] == det["class_id"]:
+                    suppressed = True
+                    break
+        if not suppressed:
+            kept.append(det)
+    return kept
+
+
+def verify_crop_with_coco(img_bgr, xyxy, conf_thresh=0.50):
     h_img, w_img = img_bgr.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in xyxy]
     pad_x = int((x2 - x1) * 0.08)
     pad_y = int((y2 - y1) * 0.08)
     x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
     x2, y2 = min(w_img, x2 + pad_x), min(h_img, y2 + pad_y)
-    if (x2 - x1) <= 4 or (y2 - y1) <= 4:
-        return False, 1
+    if (x2 - x1) <= 8 or (y2 - y1) <= 8:
+        return False, None
     if coco_verifier is not None:
         crop = img_bgr[y1:y2, x1:x2]
         if crop.size > 0:
             try:
                 res = coco_verifier.predict(
-                    source=crop, classes=COCO_RELEVANT_CLASSES, conf=0.25, device=device, verbose=False
+                    source=crop,
+                    classes=COCO_RELEVANT_CLASSES,
+                    conf=max(0.40, conf_thresh * 0.85),
+                    device=device,
+                    verbose=False,
                 )
                 c_boxes = res[0].boxes
                 if len(c_boxes) > 0:
+                    for cb in c_boxes:
+                        if int(cb.cls[0].item()) == 0:
+                            return True, 3
                     best_c_cls = int(c_boxes.cls[0].item())
-                    if best_c_cls == 0:
-                        return True, 3
-                    elif best_c_cls in COCO_TO_SENTINEL:
+                    best_c_conf = float(c_boxes.conf[0].item())
+                    if best_c_cls in COCO_TO_SENTINEL and best_c_conf >= conf_thresh:
                         return False, COCO_TO_SENTINEL[best_c_cls][0]
-                return False, 1
+                return False, None
             except Exception:
                 pass
-    aspect = (y2 - y1) / float(x2 - x1)
-    return (True, 3) if aspect >= 1.25 else (False, 1)
+    return False, None
 
 
-def run_dual_model_cascade(img_bgr, conf_thresh=0.28):
+def run_dual_model_cascade(img_bgr, conf_thresh=0.50):
+    conf_thresh = max(0.50, float(conf_thresh))
+    h_img, w_img = img_bgr.shape[:2]
     primary_res = primary_model.predict(source=img_bgr, imgsz=640, conf=conf_thresh, device=device, verbose=False)[0]
     coco_detections = []
     if coco_verifier is not None:
         try:
             coco_res = coco_verifier.predict(
-                source=img_bgr, classes=COCO_RELEVANT_CLASSES, conf=conf_thresh, device=device, verbose=False
+                source=img_bgr, classes=COCO_RELEVANT_CLASSES, conf=max(0.45, conf_thresh * 0.9), device=device, verbose=False
             )[0]
             for cbox in coco_res.boxes:
                 c_cls = int(cbox.cls[0].item())
@@ -178,7 +236,7 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.28):
                     resolved_cls = c_s_cls if c_s_cls in (0, 1, 2) else 1
                     resolved_conf = max(p_conf, c_conf)
             else:
-                if c_s_cls == 3 and c_conf >= 0.35:
+                if c_s_cls == 3 and c_conf >= 0.40:
                     resolved_cls = 3
                     resolved_conf = max(p_conf, c_conf)
                 elif c_sub in ("cat", "dog"):
@@ -188,8 +246,21 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.28):
                     resolved_conf = max(p_conf, c_conf)
         else:
             if p_cls == 3:
-                is_human, override_cls = verify_crop_with_coco(img_bgr, p_xyxy)
-                resolved_cls = 3 if is_human else override_cls
+                is_human, override_cls = verify_crop_with_coco(img_bgr, p_xyxy, conf_thresh=conf_thresh)
+                if is_human:
+                    resolved_cls = 3
+                elif override_cls is not None:
+                    resolved_cls = override_cls
+                else:
+                    continue
+            elif p_cls == 1:
+                box_w = max(1.0, p_xyxy[2] - p_xyxy[0])
+                box_h = max(1.0, p_xyxy[3] - p_xyxy[1])
+                if (box_h / float(h_img)) > 0.80 and (box_h / box_w) > 1.65:
+                    continue
+
+        if resolved_conf < conf_thresh:
+            continue
 
         class_name = SENTINEL_CLASS_NAMES.get(resolved_cls, "SMALL MAMMAL")
         final_detections.append({
@@ -201,7 +272,7 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.28):
         })
 
     for cd in coco_detections:
-        if not cd["matched"] and cd["conf"] >= 0.45:
+        if not cd["matched"] and cd["conf"] >= conf_thresh:
             if any(compute_iou(cd["xyxy"], fd["bbox"]) >= 0.35 for fd in final_detections):
                 continue
             s_cls = cd["sentinel_cls"]
@@ -214,7 +285,7 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.28):
                 "bbox": cd["xyxy"],
             })
 
-    return final_detections
+    return deduplicate_detections(final_detections)
 
 
 def trigger_esp32_alarm(animal_token, duration_ms):
@@ -312,6 +383,8 @@ class ThreadedCamera:
 
     def release(self):
         self.stopped = True
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
         self.cap.release()
 
 
@@ -370,6 +443,8 @@ if __name__ == "__main__":
 
     cam = ThreadedCamera(raw_cap)
     last_deterrent_time = 0.0
+    last_deterrent_dur_sec = 0.0
+    deterrent_active = False
     cooldown = 5.0
 
     colors_bgr = {
@@ -422,7 +497,7 @@ if __name__ == "__main__":
             frame = awb_processor.balance(frame)
 
         t0 = time.perf_counter()
-        detections = run_dual_model_cascade(frame, conf_thresh=0.28)
+        detections = run_dual_model_cascade(frame, conf_thresh=0.50)
         infer_ms = (time.perf_counter() - t0) * 1000.0
 
         annotated = frame.copy()
@@ -453,13 +528,21 @@ if __name__ == "__main__":
         safe_dets = [d for d in detections if d["class_id"] == 3]
         threat_dets = [d for d in detections if d["class_id"] in (0, 1, 2)]
 
-        # Human Safety Override First
+        now = time.time()
+        if deterrent_active and (now - last_deterrent_time) >= last_deterrent_dur_sec:
+            deterrent_active = False
+
+        # Human Safety Override First — immediately send STOP if deterrent is running
         if safe_dets:
-            pass  # 0 deterrents engaged when human is present
+            if deterrent_active:
+                print(f"[{time.strftime('%H:%M:%S')}] HUMAN VERIFIED (SAFE) -> Sending STOP to ESP32")
+                trigger_esp32_alarm("STOP", 0)
+                deterrent_active = False
+                last_deterrent_time = 0.0
+                last_deterrent_dur_sec = 0.0
         elif threat_dets:
             top_cls = max(d["class_id"] for d in threat_dets)
             top_conf = max(d["confidence"] for d in threat_dets if d["class_id"] == top_cls)
-            now = time.time()
             if now - last_deterrent_time >= cooldown:
                 if top_cls == 2:
                     token, dur, act = "LARGE", random.randint(8000, 14000), "SOUND + LIGHT + WATER"
@@ -471,6 +554,8 @@ if __name__ == "__main__":
                 print(f"[{time.strftime('%H:%M:%S')}] {SENTINEL_CLASS_NAMES[top_cls]} ({top_conf:.2f} | {infer_ms:.1f}ms) -> {act} ({dur}ms)")
                 trigger_esp32_alarm(token, dur)
                 last_deterrent_time = now
+                last_deterrent_dur_sec = dur / 1000.0
+                deterrent_active = True
 
         if os.environ.get("DISPLAY"):
             cv2.imshow("Sentinel Wildlife Deterrent System v2.0", annotated)

@@ -9,10 +9,11 @@ static volatile bool stopRequested = false;
 static volatile bool buzzerRunning = false;
 static volatile uint32_t activeStartTimeMs = 0;
 static volatile uint32_t activeDurationMs = 0;
+static volatile uint32_t buzzerCommandGen = 0;
 
-static String pendingTarget = "NONE";
-static uint32_t pendingDurationMs = 5000;
-static String lastExecutedTarget = "NONE";
+static char pendingTargetBuf[32] = "NONE";
+static uint32_t pendingDurationMs = 0;
+static char lastExecutedTargetBuf[32] = "NONE";
 
 static void buzzerWorkerTask(void* parameter);
 
@@ -26,9 +27,7 @@ static inline bool shouldAbort() {
 }
 
 void silenceBuzzer() {
-  noTone(PIN_BUZZER);
-  pinMode(PIN_BUZZER, OUTPUT);
-  digitalWrite(PIN_BUZZER, LOW);
+  ledcWriteTone(PIN_BUZZER, 0);
 }
 
 // Interruptible millisecond delay that checks deadline & stop flag every 2ms
@@ -65,7 +64,10 @@ uint32_t getRandomizedClassDurationMs(const String& target) {
 
 void setupBuzzer() {
   randomSeed(esp_random());
-  silenceBuzzer();
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  ledcAttach(PIN_BUZZER, 2000, 10);
+  ledcWriteTone(PIN_BUZZER, 0);
 
   if (buzzerTaskHandle == NULL) {
     xTaskCreatePinnedToCore(
@@ -73,12 +75,12 @@ void setupBuzzer() {
       "BuzzerWorker",
       4096,
       NULL,
-      2,
+      1,
       &buzzerTaskHandle,
-      0
+      1
     );
   }
-  Serial.printf("[BUZZER] Zero-latency persistent worker initialized on GPIO %d\n", PIN_BUZZER);
+  Serial.printf("[BUZZER] Zero-latency persistent worker initialized on GPIO %d (Core 1)\n", PIN_BUZZER);
 }
 
 bool isBuzzerActive() {
@@ -86,7 +88,11 @@ bool isBuzzerActive() {
 }
 
 String getLastTarget() {
-  return lastExecutedTarget;
+  char buf[32];
+  portENTER_CRITICAL(&buzzerMux);
+  strlcpy(buf, lastExecutedTargetBuf, sizeof(buf));
+  portEXIT_CRITICAL(&buzzerMux);
+  return String(buf);
 }
 
 uint32_t getCurrentDurationMs() {
@@ -100,10 +106,40 @@ uint32_t getRemainingDurationMs() {
   return activeDurationMs - elapsed;
 }
 
+bool isBuzzerTargetAllowed(const String& target) {
+  String t = target;
+  t.toUpperCase();
+  t.trim();
+
+  if (t.length() == 0 || t == "OFF" || t == "STOP" || t == "NONE" || t == "SAFE" || t == "HUMAN" || t == "3") {
+    return false;
+  }
+  if (t.indexOf("WATER") >= 0 || t.indexOf("PUMP") >= 0 ||
+      t.indexOf("LIGHT") >= 0 || t.indexOf("LED") >= 0) {
+    return false;
+  }
+  if (t == "SOUND" || t == "BUZZER" || t == "SOUND_TEST" || t == "BUZZER_TEST" ||
+      t.startsWith("SOUND_TEST_") || t.startsWith("BUZZER_TEST_")) {
+    return true;
+  }
+  if (t.indexOf("BIRD") >= 0 || t == "0" ||
+      t.indexOf("SMALL") >= 0 || t == "SQUIRREL" || t == "DOG" || t == "CAT" ||
+      t == "RABBIT" || t == "RACCOON" || t == "FOX" || t == "1" ||
+      t.indexOf("LARGE") >= 0 || t == "DEER" || t == "COYOTE" ||
+      t == "COW" || t == "BEAR" || t == "2") {
+    return true;
+  }
+  return false;
+}
+
 void stopBuzzer() {
+  portENTER_CRITICAL(&buzzerMux);
   stopRequested = true;
+  pendingDurationMs = 0;
+  buzzerCommandGen++;
   buzzerRunning = false;
   activeDurationMs = 0;
+  portEXIT_CRITICAL(&buzzerMux);
   silenceBuzzer();
   Serial.println("[BUZZER] Sound deterrent immediately silenced.");
 }
@@ -115,8 +151,8 @@ void stopBuzzer() {
 void playPredatorClicking(int numClicks) {
   for (int i = 0; i < numClicks; i++) {
     if (shouldAbort()) { silenceBuzzer(); return; }
-    tone(PIN_BUZZER, 2000 + random(-60, 65));
-    delay(3);
+    ledcWriteTone(PIN_BUZZER, (uint32_t)(2000 + random(-60, 65)));
+    if (!waitInterruptible(3)) return;
     silenceBuzzer();
     int interval = 24 + (int)(16.0 * sin(i * 0.28)) + random(-4, 7);
     if (interval < 8) interval = 8;
@@ -128,15 +164,15 @@ void playRaptorScreech(int sweepDelayMs, int tailCycles) {
   for (int f = 2780; f >= 1840; f -= 25) {
     if (shouldAbort()) { silenceBuzzer(); return; }
     int jitter = (f % 50 == 0) ? random(70, 115) : -random(55, 95);
-    tone(PIN_BUZZER, f + jitter);
-    delay(sweepDelayMs);
+    ledcWriteTone(PIN_BUZZER, (uint32_t)max(400, f + jitter));
+    if (!waitInterruptible((uint32_t)max(1, sweepDelayMs))) return;
   }
   for (int i = 0; i < tailCycles; i++) {
     if (shouldAbort()) { silenceBuzzer(); return; }
-    tone(PIN_BUZZER, 2080 + random(-30, 35));
-    delay(random(5, 10));
-    tone(PIN_BUZZER, 1950 + random(-30, 35));
-    delay(random(5, 10));
+    ledcWriteTone(PIN_BUZZER, (uint32_t)(2080 + random(-30, 35)));
+    if (!waitInterruptible((uint32_t)random(5, 10))) return;
+    ledcWriteTone(PIN_BUZZER, (uint32_t)(1950 + random(-30, 35)));
+    if (!waitInterruptible((uint32_t)random(5, 10))) return;
   }
   silenceBuzzer();
 }
@@ -144,7 +180,7 @@ void playRaptorScreech(int sweepDelayMs, int tailCycles) {
 void playStaccatoAlarm(int bursts, int onMs, int offMs) {
   for (int i = 0; i < bursts; i++) {
     if (shouldAbort()) { silenceBuzzer(); return; }
-    tone(PIN_BUZZER, 2000 + random(-40, 45));
+    ledcWriteTone(PIN_BUZZER, (uint32_t)(2000 + random(-40, 45)));
     if (!waitInterruptible((uint32_t)onMs)) return;
     silenceBuzzer();
     if (!waitInterruptible((uint32_t)offMs)) return;
@@ -155,9 +191,9 @@ void playHarshWarble(int durationMs) {
   uint32_t start = millis();
   while (millis() - start < (uint32_t)durationMs) {
     if (shouldAbort()) { silenceBuzzer(); return; }
-    tone(PIN_BUZZER, 1980 + random(-35, 35));
+    ledcWriteTone(PIN_BUZZER, (uint32_t)(1980 + random(-35, 35)));
     if (!waitInterruptible((uint32_t)random(18, 34))) return;
-    tone(PIN_BUZZER, 2130 + random(-35, 35));
+    ledcWriteTone(PIN_BUZZER, (uint32_t)(2130 + random(-35, 35)));
     if (!waitInterruptible((uint32_t)random(18, 34))) return;
   }
   silenceBuzzer();
@@ -166,9 +202,9 @@ void playHarshWarble(int durationMs) {
 void playDualToneSiren(int cycles, int halfCycleMs) {
   for (int i = 0; i < cycles; i++) {
     if (shouldAbort()) { silenceBuzzer(); return; }
-    tone(PIN_BUZZER, 1950);
+    ledcWriteTone(PIN_BUZZER, 1950);
     if (!waitInterruptible((uint32_t)halfCycleMs)) return;
-    tone(PIN_BUZZER, 2150);
+    ledcWriteTone(PIN_BUZZER, 2150);
     if (!waitInterruptible((uint32_t)halfCycleMs)) return;
   }
   silenceBuzzer();
@@ -183,21 +219,35 @@ static void buzzerWorkerTask(void* parameter) {
     // Sleep until woken instantaneously by triggerDeterrent()
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    String target;
-    uint32_t maxDuration;
+    char targetBuf[32];
+    uint32_t maxDuration = 0;
+    uint32_t myGen = 0;
 
     portENTER_CRITICAL(&buzzerMux);
-    target = pendingTarget;
+    myGen = buzzerCommandGen;
+    strlcpy(targetBuf, pendingTargetBuf, sizeof(targetBuf));
     maxDuration = pendingDurationMs;
-    stopRequested = false;
-    activeStartTimeMs = millis();
-    activeDurationMs = maxDuration;
-    buzzerRunning = true;
+    pendingDurationMs = 0;
+    if (maxDuration > 0) {
+      stopRequested = false;
+      activeStartTimeMs = millis();
+      activeDurationMs = maxDuration;
+      buzzerRunning = true;
+      strlcpy(lastExecutedTargetBuf, targetBuf, sizeof(lastExecutedTargetBuf));
+    } else {
+      buzzerRunning = false;
+      activeDurationMs = 0;
+    }
     portEXIT_CRITICAL(&buzzerMux);
 
+    if (maxDuration == 0) {
+      silenceBuzzer();
+      continue;
+    }
+
+    String target(targetBuf);
     target.toUpperCase();
     target.trim();
-    lastExecutedTarget = target;
 
     Serial.printf("\n[BUZZER] >>> Executing Randomized Sound Deterrent for: %s (Duration: %u ms) <<<\n",
                   target.c_str(), maxDuration);
@@ -249,8 +299,12 @@ static void buzzerWorkerTask(void* parameter) {
 
     silenceBuzzer();
     uint32_t elapsed = millis() - activeStartTimeMs;
-    buzzerRunning = false;
-    activeDurationMs = 0;
+    portENTER_CRITICAL(&buzzerMux);
+    if (buzzerCommandGen == myGen) {
+      buzzerRunning = false;
+      activeDurationMs = 0;
+    }
+    portEXIT_CRITICAL(&buzzerMux);
     Serial.printf("[BUZZER] Sequence finished for: %s (%lu ms elapsed)\n\n", target.c_str(), elapsed);
   }
 }
@@ -260,17 +314,25 @@ uint32_t triggerDeterrent(const String& target, uint32_t durationMs) {
   t.toUpperCase();
   t.trim();
 
-  if (t == "OFF" || t == "STOP" || t == "NONE" || t == "SAFE" || t == "3") {
+  if (t == "OFF" || t == "STOP" || t == "NONE" || t == "SAFE" || t == "HUMAN" || t == "3") {
     stopBuzzer();
     return 0;
   }
 
+  if (!isBuzzerTargetAllowed(t)) {
+    return 0;
+  }
+
   uint32_t resolvedDuration = (durationMs > 0) ? durationMs : getRandomizedClassDurationMs(t);
+  if (resolvedDuration == 0) {
+    return 0;
+  }
 
   portENTER_CRITICAL(&buzzerMux);
   stopRequested = true; // Preempt any active tone loop immediately
-  pendingTarget = t;
+  strlcpy(pendingTargetBuf, t.c_str(), sizeof(pendingTargetBuf));
   pendingDurationMs = resolvedDuration;
+  buzzerCommandGen++;
   portEXIT_CRITICAL(&buzzerMux);
 
   if (buzzerTaskHandle != NULL) {

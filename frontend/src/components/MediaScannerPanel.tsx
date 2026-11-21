@@ -54,9 +54,6 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
       const eventRecord = await onUploadMedia(selectedFile, confThreshold);
       if (eventRecord) {
         setLastResult(eventRecord);
-        if (eventRecord.media_type === 'video') {
-          onSelectEvent(eventRecord);
-        }
         setSelectedFile(null);
         if (fileInputRef.current) {
           fileInputRef.current.value = '';
@@ -154,7 +151,7 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-msvideo,video/webm,video/x-matroska,application/zip,.jpg,.jpeg,.png,.webp,.mp4,.mov,.avi,.webm,.mkv,.zip"
+            accept="image/jpeg,image/png,image/webp,image/bmp,image/gif,video/mp4,video/quicktime,video/x-msvideo,video/webm,video/x-matroska,video/x-m4v,video/3gpp,application/zip,.jpg,.jpeg,.png,.webp,.bmp,.jfif,.mp4,.mov,.avi,.webm,.mkv,.m4v,.3gp,.zip"
             onChange={handleFileChange}
             className="hidden"
           />
@@ -241,9 +238,10 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
 
       {/* Immediate Last Scan Banner */}
       {lastResult && (
-        <div
+        <button
+          type="button"
           onClick={() => onSelectEvent(lastResult)}
-          className="mt-4 rounded-lg border border-slate-700/80 bg-[#080c14] p-3 transition hover:border-sky-500/50 cursor-pointer"
+          className="mt-4 w-full rounded-lg border border-slate-700/80 bg-[#080c14] p-3 text-left transition hover:border-sky-500/50 cursor-pointer"
         >
           <div className="flex items-center justify-between">
             <span className="font-mono-tabular text-[10px] uppercase tracking-wider text-slate-400">
@@ -267,7 +265,7 @@ export const MediaScannerPanel: React.FC<MediaScannerPanelProps> = ({
                 : `${lastResult.primary_target} — ${lastResult.action_taken}`}
             </div>
           </div>
-        </div>
+        </button>
       )}
     </section>
   );

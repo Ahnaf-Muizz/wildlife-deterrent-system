@@ -12,7 +12,6 @@ import {
   DashboardResponse,
   DeterrentEventRecord,
   DeterrentTelemetry,
-  ModelStatusInfo,
   PaginationInfo,
   QrQueueSnapshot,
 } from './types/sentinel';
@@ -25,6 +24,29 @@ import { FullPageLiveCamera } from './components/FullPageLiveCamera';
 import { QrUploadModal } from './components/QrUploadModal';
 import { MobileQrUploadPage } from './components/MobileQrUploadPage';
 import { notificationService } from './services/notificationService';
+
+async function parseJsonSafely<T = Record<string, unknown>>(
+  res: Response,
+  fallbackError: string
+): Promise<T> {
+  const text = await res.text();
+  let parsed: Record<string, unknown> = {};
+  if (text) {
+    try {
+      parsed = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      parsed = {};
+    }
+  }
+  if (!res.ok) {
+    const serverMsg =
+      typeof parsed.error === 'string' && parsed.error.trim().length > 0
+        ? parsed.error
+        : `${fallbackError} (HTTP ${res.status})`;
+    throw new Error(serverMsg);
+  }
+  return parsed as T;
+}
 
 export const App: React.FC = () => {
   const [metrics, setMetrics] = useState<DashboardMetrics>({
@@ -57,18 +79,13 @@ export const App: React.FC = () => {
     remaining_ms: 0,
   });
 
-  const [models, setModels] = useState<ModelStatusInfo>({
-    primary: 'best.pt',
-    secondary: 'yolo11n.pt (COCO Offline Cascade)',
-    device: 'GPU / CPU',
-    offline_mode: true,
-  });
-
   const [targetFilter, setTargetFilter] = useState<string>('ALL');
   const [mediaFilter, setMediaFilter] = useState<string>('ALL');
   const [page, setPage] = useState<number>(1);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const [selectedEvent, setSelectedEvent] = useState<DeterrentEventRecord | null>(null);
+  const [autoSyncVideoHardware, setAutoSyncVideoHardware] = useState<boolean>(false);
   const [isLiveCameraOpen, setIsLiveCameraOpen] = useState<boolean>(false);
   const [isQrModalOpen, setIsQrModalOpen] = useState<boolean>(false);
   const [qrQueueSnapshot, setQrQueueSnapshot] = useState<QrQueueSnapshot>({
@@ -80,12 +97,16 @@ export const App: React.FC = () => {
     jobs: [],
     network: {
       ips: [],
+      on_esp32_ap: false,
       port: 5002,
       primary_url: '',
       urls: [],
     },
   });
-  const lastCompletedCountRef = useRef<number>(0);
+  const lastCompletedCountRef = useRef<number | null>(null);
+  const dashboardAbortRef = useRef<AbortController | null>(null);
+  const queueFetchInFlightRef = useRef<boolean>(false);
+  const statusFetchInFlightRef = useRef<boolean>(false);
 
   const isMobileQrRoute =
     typeof window !== 'undefined' &&
@@ -108,6 +129,9 @@ export const App: React.FC = () => {
   );
 
   const fetchDashboard = useCallback(async () => {
+    dashboardAbortRef.current?.abort();
+    const controller = new AbortController();
+    dashboardAbortRef.current = controller;
     try {
       const params = new URLSearchParams({
         target: targetFilter,
@@ -115,63 +139,80 @@ export const App: React.FC = () => {
         page: String(page),
         per_page: '24',
       });
-      const res = await fetch(`/api/dashboard?${params.toString()}`);
+      const res = await fetch(`/api/dashboard?${params.toString()}`, {
+        signal: controller.signal,
+      });
       if (!res.ok) return;
       const data: DashboardResponse = await res.json();
       setMetrics(data.metrics);
       setEvents(data.events);
       setPagination(data.pagination);
       setTelemetry(data.telemetry);
-      setModels(data.models);
     } catch {
-      // Ignore transient network errors
+      // Ignore aborted or transient network errors
+    } finally {
+      if (dashboardAbortRef.current === controller) {
+        dashboardAbortRef.current = null;
+      }
     }
   }, [targetFilter, mediaFilter, page]);
 
   const fetchQrQueue = useCallback(async () => {
+    if (queueFetchInFlightRef.current) return;
+    queueFetchInFlightRef.current = true;
     try {
       const res = await fetch('/api/qr/queue');
       if (!res.ok) return;
       const snap: QrQueueSnapshot = await res.json();
       setQrQueueSnapshot(snap);
-      if (snap.completed_count > lastCompletedCountRef.current) {
-        lastCompletedCountRef.current = snap.completed_count;
-        fetchDashboard();
-      } else {
-        lastCompletedCountRef.current = snap.completed_count;
+      if (
+        lastCompletedCountRef.current !== null &&
+        snap.completed_count > lastCompletedCountRef.current
+      ) {
+        void fetchDashboard();
       }
+      lastCompletedCountRef.current = snap.completed_count;
     } catch {
       // Ignore transient network errors
+    } finally {
+      queueFetchInFlightRef.current = false;
     }
   }, [fetchDashboard]);
 
   useEffect(() => {
     if (isMobileQrRoute) return;
-    fetchDashboard();
-    fetchQrQueue();
+    void fetchDashboard();
+    void fetchQrQueue();
     const syncTimer = window.setInterval(() => {
-      fetchDashboard();
-      fetchQrQueue();
+      void fetchDashboard();
+      void fetchQrQueue();
     }, 3500);
-    return () => clearInterval(syncTimer);
+    return () => {
+      clearInterval(syncTimer);
+      dashboardAbortRef.current?.abort();
+    };
   }, [fetchDashboard, fetchQrQueue, isMobileQrRoute]);
 
+  const hasActiveQueue = qrQueueSnapshot.active_count > 0;
   useEffect(() => {
     if (isMobileQrRoute) return;
-    if (!isQrModalOpen && qrQueueSnapshot.active_count === 0) return;
+    if (!isQrModalOpen && !hasActiveQueue) return;
     if (isQrModalOpen) {
-      fetchQrQueue();
+      void fetchQrQueue();
     }
     const fastTimer = window.setInterval(() => {
-      fetchQrQueue();
+      void fetchQrQueue();
     }, 1200);
     return () => clearInterval(fastTimer);
-  }, [isQrModalOpen, qrQueueSnapshot.active_count, fetchQrQueue, isMobileQrRoute]);
+  }, [isQrModalOpen, hasActiveQueue, fetchQrQueue, isMobileQrRoute]);
 
   // Smooth telemetry countdown polling while actuators are active + periodic ESP32 status check
   useEffect(() => {
+    if (isMobileQrRoute) return;
     const intervalMs = telemetry.is_active ? 200 : 3000;
     const timer = window.setInterval(async () => {
+      if (statusFetchInFlightRef.current) return;
+      statusFetchInFlightRef.current = true;
       try {
         const res = await fetch('/api/esp32/status');
         if (res.ok) {
@@ -180,10 +221,12 @@ export const App: React.FC = () => {
         }
       } catch {
         // Ignore
+      } finally {
+        statusFetchInFlightRef.current = false;
       }
     }, intervalMs);
     return () => clearInterval(timer);
-  }, [telemetry.is_active]);
+  }, [telemetry.is_active, isMobileQrRoute]);
 
   const handleUploadMedia = async (
     file: File,
@@ -198,10 +241,10 @@ export const App: React.FC = () => {
       method: 'POST',
       body: formData,
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Upload scan failed');
-    }
+    const data = await parseJsonSafely<{
+      event: DeterrentEventRecord;
+      telemetry?: DeterrentTelemetry;
+    }>(res, 'Upload scan failed');
 
     const ev: DeterrentEventRecord = data.event;
     if (data.telemetry) {
@@ -209,6 +252,7 @@ export const App: React.FC = () => {
     }
 
     if (ev.media_type === 'video') {
+      setAutoSyncVideoHardware(true);
       setSelectedEvent(ev);
     } else if (ev.primary_target !== 'None') {
       notificationService.notifyDetection(
@@ -224,42 +268,74 @@ export const App: React.FC = () => {
     return ev;
   };
 
-  const handleTestActuator = async (actuator: ActuatorType, pattern: string) => {
-    const res = await fetch('/api/deterrent/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ actuator, pattern }),
-    });
-    if (res.ok) {
-      const data = await res.json();
+  const handleTestActuator = async (
+    actuator: ActuatorType,
+    pattern: string,
+    durationMs?: number
+  ) => {
+    try {
+      setActionError(null);
+      const res = await fetch('/api/deterrent/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          actuator,
+          pattern,
+          duration_ms: durationMs && durationMs > 0 ? durationMs : 0,
+        }),
+      });
+      const data = await parseJsonSafely<{ telemetry?: DeterrentTelemetry }>(
+        res,
+        'Hardware test trigger failed'
+      );
       if (data.telemetry) {
         setTelemetry(data.telemetry);
       }
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Hardware test trigger failed');
     }
   };
 
   const handleStopAll = async () => {
-    const res = await fetch('/api/deterrent/stop', { method: 'POST' });
-    if (res.ok) {
-      const data = await res.json();
+    try {
+      setActionError(null);
+      const res = await fetch('/api/deterrent/stop', { method: 'POST' });
+      const data = await parseJsonSafely<{ telemetry?: DeterrentTelemetry }>(
+        res,
+        'Emergency stop command failed'
+      );
       if (data.telemetry) {
         setTelemetry(data.telemetry);
       }
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Emergency stop command failed');
     }
   };
 
   const handleDeleteEvent = async (id: number) => {
-    await fetch(`/api/events/${id}`, { method: 'DELETE' });
-    await fetchDashboard();
+    try {
+      setActionError(null);
+      const res = await fetch(`/api/events/${id}`, { method: 'DELETE' });
+      await parseJsonSafely(res, 'Failed to delete event record');
+      await fetchDashboard();
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Failed to delete event record');
+    }
   };
 
   const handleClearAll = async () => {
     if (!window.confirm('Permanently delete all logged pictures, videos, and deterrent records?')) {
       return;
     }
-    await fetch('/api/events/clear', { method: 'POST' });
-    setPage(1);
-    await fetchDashboard();
+    try {
+      setActionError(null);
+      const res = await fetch('/api/events/clear', { method: 'POST' });
+      await parseJsonSafely(res, 'Failed to clear event history');
+      setPage(1);
+      await fetchDashboard();
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Failed to clear event history');
+    }
   };
 
   const handleToggleMute = () => {
@@ -285,21 +361,23 @@ export const App: React.FC = () => {
       method: 'POST',
       body: formData,
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to enqueue files');
-    }
+    const data = await parseJsonSafely<{ queue?: QrQueueSnapshot }>(
+      res,
+      'Failed to enqueue files'
+    );
     if (data.queue) {
       setQrQueueSnapshot(data.queue);
     }
   };
 
   const handleClearCompletedQueue = async () => {
-    const res = await fetch('/api/qr/queue/clear', { method: 'POST' });
-    if (res.ok) {
-      const snap: QrQueueSnapshot = await res.json();
+    try {
+      const res = await fetch('/api/qr/queue/clear', { method: 'POST' });
+      const snap = await parseJsonSafely<QrQueueSnapshot>(res, 'Failed to clear queue');
       setQrQueueSnapshot(snap);
       lastCompletedCountRef.current = snap.completed_count;
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Failed to clear queue');
     }
   };
 
@@ -307,12 +385,16 @@ export const App: React.FC = () => {
     return <MobileQrUploadPage />;
   }
 
+  const openArchivedEvent = (ev: DeterrentEventRecord) => {
+    setAutoSyncVideoHardware(false);
+    setSelectedEvent(ev);
+  };
+
   return (
     <div className="flex min-h-screen flex-col bg-[#090d14] text-slate-100">
       {/* Top Command & Telemetry Header */}
       <TopTelemetryBar
         telemetry={telemetry}
-        models={models}
         isPrimaryHost={isPrimaryHost}
         isMuted={isMuted}
         notificationPermission={notifPerm}
@@ -328,14 +410,31 @@ export const App: React.FC = () => {
 
       {/* Main Content Container */}
       <main className="mx-auto flex w-full max-w-[1680px] flex-1 flex-col gap-6 px-6 py-6">
-        {/* 5-Card Incursion Telemetry Strip (Preserving & Enhancing Existing Metrics) */}
-        <section className="grid grid-cols-2 gap-4 md:grid-cols-5">
+        {actionError && (
           <div
+            role="alert"
+            className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-2.5 font-mono-tabular text-xs text-rose-300"
+          >
+            <span>{actionError}</span>
+            <button
+              type="button"
+              onClick={() => setActionError(null)}
+              className="rounded border border-rose-500/40 px-2 py-0.5 text-[10px] font-bold hover:bg-rose-500/20 cursor-pointer"
+            >
+              DISMISS
+            </button>
+          </div>
+        )}
+
+        {/* 5-Card Incursion Telemetry Strip (Semantic Native Buttons) */}
+        <section className="grid grid-cols-2 gap-4 md:grid-cols-5">
+          <button
+            type="button"
             onClick={() => {
               setTargetFilter('ALL');
               setPage(1);
             }}
-            className={`rounded-xl border p-4 transition cursor-pointer ${
+            className={`rounded-xl border p-4 text-left transition cursor-pointer ${
               targetFilter === 'ALL'
                 ? 'border-sky-500/50 bg-[#101829]'
                 : 'border-slate-800/90 bg-[#0d1320] hover:border-slate-700'
@@ -353,14 +452,15 @@ export const App: React.FC = () => {
             <div className="mt-1 font-mono-tabular text-[11px] text-slate-500">
               Persistent SQLite WAL Archive
             </div>
-          </div>
+          </button>
 
-          <div
+          <button
+            type="button"
             onClick={() => {
               setTargetFilter('LARGE MAMMAL');
               setPage(1);
             }}
-            className={`rounded-xl border p-4 transition cursor-pointer ${
+            className={`rounded-xl border p-4 text-left transition cursor-pointer ${
               targetFilter === 'LARGE MAMMAL'
                 ? 'border-rose-500/60 bg-rose-500/10'
                 : 'border-slate-800/90 bg-[#0d1320] hover:border-rose-500/40'
@@ -378,14 +478,15 @@ export const App: React.FC = () => {
             <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
               Sound + Light + Water (8–14s)
             </div>
-          </div>
+          </button>
 
-          <div
+          <button
+            type="button"
             onClick={() => {
               setTargetFilter('SMALL MAMMAL');
               setPage(1);
             }}
-            className={`rounded-xl border p-4 transition cursor-pointer ${
+            className={`rounded-xl border p-4 text-left transition cursor-pointer ${
               targetFilter === 'SMALL MAMMAL'
                 ? 'border-amber-500/60 bg-amber-500/10'
                 : 'border-slate-800/90 bg-[#0d1320] hover:border-amber-500/40'
@@ -403,14 +504,15 @@ export const App: React.FC = () => {
             <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
               Water + Sound (5–9s)
             </div>
-          </div>
+          </button>
 
-          <div
+          <button
+            type="button"
             onClick={() => {
               setTargetFilter('BIRD');
               setPage(1);
             }}
-            className={`rounded-xl border p-4 transition cursor-pointer ${
+            className={`rounded-xl border p-4 text-left transition cursor-pointer ${
               targetFilter === 'BIRD'
                 ? 'border-sky-500/60 bg-sky-500/10'
                 : 'border-slate-800/90 bg-[#0d1320] hover:border-sky-500/40'
@@ -428,14 +530,15 @@ export const App: React.FC = () => {
             <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
               Sound + Light (3–6s)
             </div>
-          </div>
+          </button>
 
-          <div
+          <button
+            type="button"
             onClick={() => {
               setTargetFilter('SAFE');
               setPage(1);
             }}
-            className={`rounded-xl border p-4 transition cursor-pointer ${
+            className={`rounded-xl border p-4 text-left transition cursor-pointer ${
               targetFilter === 'SAFE'
                 ? 'border-emerald-500/60 bg-emerald-500/10'
                 : 'border-slate-800/90 bg-[#0d1320] hover:border-emerald-500/40'
@@ -453,7 +556,7 @@ export const App: React.FC = () => {
             <div className="mt-1 font-mono-tabular text-[11px] text-slate-400">
               {metrics.safe_humans} Humans • {metrics.clear_scans} Clear (0 Triggers)
             </div>
-          </div>
+          </button>
         </section>
 
         {/* Two-Column Tactical Workspace */}
@@ -468,7 +571,7 @@ export const App: React.FC = () => {
               }}
               onOpenQrModal={() => setIsQrModalOpen(true)}
               qrQueueSnapshot={qrQueueSnapshot}
-              onSelectEvent={(ev) => setSelectedEvent(ev)}
+              onSelectEvent={openArchivedEvent}
             />
 
             <ActuatorTestPanel
@@ -494,7 +597,7 @@ export const App: React.FC = () => {
                 setPage(1);
               }}
               onPageChange={(p) => setPage(p)}
-              onSelectEvent={(ev) => setSelectedEvent(ev)}
+              onSelectEvent={openArchivedEvent}
               onDeleteEvent={handleDeleteEvent}
               onClearAll={handleClearAll}
             />
@@ -509,7 +612,7 @@ export const App: React.FC = () => {
           onClose={() => setIsLiveCameraOpen(false)}
           telemetry={telemetry}
           onTelemetryUpdate={(t) => setTelemetry(t)}
-          onSnapshotSaved={() => fetchDashboard()}
+          onSnapshotSaved={() => void fetchDashboard()}
           onStopAll={handleStopAll}
         />
       )}
@@ -517,9 +620,12 @@ export const App: React.FC = () => {
       {/* Event Detail & Video Timeline Inspection Modal */}
       <EventDetailModal
         event={selectedEvent}
-        telemetry={telemetry}
+        autoSyncHardware={autoSyncVideoHardware}
         onTelemetryUpdate={(t) => setTelemetry(t)}
-        onClose={() => setSelectedEvent(null)}
+        onClose={() => {
+          setSelectedEvent(null);
+          setAutoSyncVideoHardware(false);
+        }}
         onDelete={handleDeleteEvent}
       />
 
@@ -530,7 +636,7 @@ export const App: React.FC = () => {
         queueSnapshot={qrQueueSnapshot}
         onEnqueueFiles={handleEnqueueFiles}
         onClearCompleted={handleClearCompletedQueue}
-        onSelectEvent={(ev) => setSelectedEvent(ev)}
+        onSelectEvent={openArchivedEvent}
       />
     </div>
   );

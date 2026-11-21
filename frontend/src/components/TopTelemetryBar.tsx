@@ -10,16 +10,14 @@ import {
   Square,
   Droplets,
   Zap,
-  Cpu,
   Wifi,
   QrCode,
   Loader2,
 } from 'lucide-react';
-import { DeterrentTelemetry, ModelStatusInfo } from '../types/sentinel';
+import { DeterrentTelemetry } from '../types/sentinel';
 
 interface TopTelemetryBarProps {
   telemetry: DeterrentTelemetry;
-  models: ModelStatusInfo;
   isPrimaryHost?: boolean;
   isMuted: boolean;
   notificationPermission: NotificationPermission;
@@ -33,7 +31,6 @@ interface TopTelemetryBarProps {
 
 export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
   telemetry,
-  models,
   isPrimaryHost = true,
   isMuted,
   notificationPermission,

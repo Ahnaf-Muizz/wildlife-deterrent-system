@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useId, useState } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import {
   Shield,
   Upload,
@@ -11,6 +11,215 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { QrQueueSnapshot } from '../types/sentinel';
+
+const IMAGE_EXT_RE = /\.(jpe?g|png|webp|bmp|heic|heif|jfif)$/i;
+
+interface EnqueueResponse {
+  enqueued_count?: number;
+  error?: string;
+  queue?: QrQueueSnapshot;
+}
+
+function isImageFile(file: File): boolean {
+  return file.type.startsWith('image/') || IMAGE_EXT_RE.test(file.name);
+}
+
+function prepareFileForUpload(file: File): Promise<File> {
+  if (!isImageFile(file)) {
+    return Promise.resolve(file);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const objectUrl = URL.createObjectURL(file);
+    let timerId = 0;
+
+    const finish = (result: File) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timerId);
+      URL.revokeObjectURL(objectUrl);
+      resolve(result);
+    };
+
+    timerId = window.setTimeout(() => finish(file), 2500);
+    const img = new Image();
+
+    img.onload = () => {
+      try {
+        const origW = img.naturalWidth || img.width;
+        const origH = img.naturalHeight || img.height;
+        if (!origW || !origH) {
+          finish(file);
+          return;
+        }
+
+        const maxDim = 1280;
+        const longest = Math.max(origW, origH);
+        const scale = longest > maxDim ? maxDim / longest : 1;
+        const targetW = Math.max(1, Math.round(origW * scale));
+        const targetH = Math.max(1, Math.round(origH * scale));
+
+        if (scale === 1 && file.type === 'image/jpeg' && file.size <= 220 * 1024) {
+          finish(file);
+          return;
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          finish(file);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, targetW, targetH);
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) {
+              finish(file);
+              return;
+            }
+            if (scale === 1 && blob.size >= file.size && /\.(jpe?g|png|webp)$/i.test(file.name)) {
+              finish(file);
+              return;
+            }
+            const baseName = file.name.replace(/\.[^.]+$/, '') || 'capture';
+            finish(new File([blob], `${baseName}.jpg`, { type: 'image/jpeg' }));
+          },
+          'image/jpeg',
+          0.82
+        );
+      } catch {
+        finish(file);
+      }
+    };
+
+    img.onerror = () => finish(file);
+    img.src = objectUrl;
+  });
+}
+
+async function checkServerReachable(): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 1800);
+  try {
+    const res = await fetch('/api/health', {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function uploadSingleFile(
+  file: File,
+  timeoutMs: number,
+  onProgress: (pct: number) => void,
+  registerXhr?: (xhr: XMLHttpRequest | null) => void
+): Promise<EnqueueResponse> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    registerXhr?.(xhr);
+    const formData = new FormData();
+    formData.append('files', file, file.name);
+    formData.append('conf', '0.50');
+    formData.append('uploader', 'Mobile QR Scanner');
+
+    xhr.open('POST', '/api/qr/enqueue', true);
+    xhr.timeout = timeoutMs;
+
+    const cleanup = () => {
+      registerXhr?.(null);
+    };
+
+    xhr.upload.onprogress = (evt) => {
+      if (evt.lengthComputable && evt.total > 0) {
+        const pct = Math.min(99, Math.round((evt.loaded / evt.total) * 100));
+        onProgress(pct);
+      }
+    };
+
+    xhr.onload = () => {
+      cleanup();
+      let data: EnqueueResponse = {};
+      try {
+        data = xhr.responseText ? (JSON.parse(xhr.responseText) as EnqueueResponse) : {};
+      } catch {
+        data = {};
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress(100);
+        resolve(data);
+      } else {
+        const err = new Error(data.error || `Upload failed (HTTP ${xhr.status})`) as Error & {
+          retryable?: boolean;
+        };
+        err.retryable = xhr.status >= 500 || xhr.status === 0;
+        reject(err);
+      }
+    };
+
+    xhr.onerror = () => {
+      cleanup();
+      const err = new Error('Network connection interrupted during upload') as Error & {
+        retryable?: boolean;
+      };
+      err.retryable = true;
+      reject(err);
+    };
+
+    xhr.ontimeout = () => {
+      cleanup();
+      const err = new Error('Upload timed out over Wi-Fi') as Error & { retryable?: boolean };
+      err.retryable = true;
+      reject(err);
+    };
+
+    xhr.onabort = () => {
+      cleanup();
+      reject(new Error('Upload cancelled'));
+    };
+
+    xhr.send(formData);
+  });
+}
+
+async function uploadSingleFileWithRetry(
+  file: File,
+  onProgress: (pct: number) => void,
+  registerXhr: (xhr: XMLHttpRequest | null) => void,
+  isCancelled: () => boolean
+): Promise<EnqueueResponse> {
+  const timeoutMs = isImageFile(file) ? 12000 : 90000;
+  try {
+    return await uploadSingleFile(file, timeoutMs, onProgress, registerXhr);
+  } catch (firstErr: unknown) {
+    if (isCancelled()) {
+      throw firstErr;
+    }
+    const retryable =
+      typeof firstErr === 'object' &&
+      firstErr !== null &&
+      'retryable' in firstErr &&
+      Boolean((firstErr as { retryable?: boolean }).retryable);
+    if (!retryable) {
+      throw firstErr;
+    }
+    const reachable = await checkServerReachable();
+    if (!reachable || isCancelled()) {
+      throw new Error(
+        'Cannot reach Dashboard PC over Wi-Fi. Verify your phone is connected to Wildlife-Deterrent-System-AP and tap Upload again.'
+      );
+    }
+    await new Promise((r) => window.setTimeout(r, 400));
+    return await uploadSingleFile(file, timeoutMs, onProgress, registerXhr);
+  }
+}
 
 const EMPTY_SNAPSHOT: QrQueueSnapshot = {
   queued_count: 0,
@@ -32,61 +241,144 @@ export const MobileQrUploadPage: React.FC = () => {
   const cameraInputId = useId();
   const formHeadingId = useId();
 
+  const isMountedRef = useRef(true);
+  const isUploadingRef = useRef(false);
+  const isPollingRef = useRef(false);
+  const cancelledRef = useRef(false);
+  const activeXhrRef = useRef<XMLHttpRequest | null>(null);
+
   const [queueSnapshot, setQueueSnapshot] = useState<QrQueueSnapshot>(EMPTY_SNAPSHOT);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      activeXhrRef.current?.abort();
+    };
+  }, []);
+
   const fetchQueue = useCallback(async () => {
+    if (isUploadingRef.current || isPollingRef.current) return;
+    isPollingRef.current = true;
+    const controller = new AbortController();
+    const abortTimer = window.setTimeout(() => controller.abort(), 3500);
     try {
-      const res = await fetch('/api/qr/queue');
+      const res = await fetch('/api/qr/queue', {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
       if (!res.ok) return;
       const data: QrQueueSnapshot = await res.json();
-      setQueueSnapshot(data);
+      if (isMountedRef.current) {
+        setQueueSnapshot(data);
+      }
     } catch {
-      // Ignore transient mobile polling errors
+      // Ignore transient mobile polling errors / timeouts
+    } finally {
+      window.clearTimeout(abortTimer);
+      isPollingRef.current = false;
     }
   }, []);
 
   useEffect(() => {
-    fetchQueue();
-    const timer = window.setInterval(fetchQueue, 1500);
-    return () => clearInterval(timer);
+    void fetchQueue();
+    const timer = window.setInterval(() => {
+      void fetchQueue();
+    }, 1500);
+    const handleResume = () => {
+      if (document.visibilityState !== 'hidden') {
+        void fetchQueue();
+      }
+    };
+    document.addEventListener('visibilitychange', handleResume);
+    window.addEventListener('pageshow', handleResume);
+    window.addEventListener('focus', handleResume);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleResume);
+      window.removeEventListener('pageshow', handleResume);
+      window.removeEventListener('focus', handleResume);
+    };
   }, [fetchQueue]);
 
-  const enqueueFiles = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+  const cancelActiveUpload = () => {
+    cancelledRef.current = true;
+    activeXhrRef.current?.abort();
+  };
+
+  const enqueueFiles = async (files: File[]) => {
+    if (files.length === 0 || isUploadingRef.current) return;
+    cancelledRef.current = false;
+    isUploadingRef.current = true;
     setIsUploading(true);
     setErrorMsg(null);
-    setStatusMessage(`Uploading ${files.length} file${files.length > 1 ? 's' : ''} to scan queue...`);
+    setUploadProgress(`PREPARING 1/${files.length}...`);
+    setStatusMessage(`Preparing ${files.length} file${files.length > 1 ? 's' : ''} for scan queue...`);
 
-    const formData = new FormData();
-    Array.from(files).forEach((f) => {
-      formData.append('files', f);
-    });
-    formData.append('conf', '0.50');
-    formData.append('uploader', 'Mobile QR Scanner');
+    let totalQueued = 0;
+    let latestQueue: QrQueueSnapshot | undefined;
 
     try {
-      const res = await fetch('/api/qr/enqueue', {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Upload failed');
+      for (let i = 0; i < files.length; i += 1) {
+        if (!isMountedRef.current || cancelledRef.current) break;
+        const idxLabel = `${i + 1}/${files.length}`;
+        setUploadProgress(`OPTIMIZING ${idxLabel}...`);
+        const prepared = await prepareFileForUpload(files[i]);
+        if (!isMountedRef.current || cancelledRef.current) break;
+        setUploadProgress(`UPLOADING ${idxLabel} (0%)...`);
+        setStatusMessage(
+          `Uploading ${idxLabel} (${Math.max(1, Math.round(prepared.size / 1024))} KB)...`
+        );
+
+        const data = await uploadSingleFileWithRetry(
+          prepared,
+          (pct) => {
+            if (isMountedRef.current) {
+              setUploadProgress(`UPLOADING ${idxLabel} (${pct}%)...`);
+            }
+          },
+          (xhr) => {
+            activeXhrRef.current = xhr;
+          },
+          () => cancelledRef.current
+        );
+        totalQueued += data.enqueued_count ?? 1;
+        if (data.queue && isMountedRef.current) {
+          latestQueue = data.queue;
+          setQueueSnapshot(data.queue);
+        }
       }
-      if (data.queue) {
-        setQueueSnapshot(data.queue);
+
+      if (isMountedRef.current && !cancelledRef.current) {
+        if (latestQueue) {
+          setQueueSnapshot(latestQueue);
+        }
+        setStatusMessage(
+          `Queued ${totalQueued} file${totalQueued > 1 ? 's' : ''} for automatic AI scanning!`
+        );
       }
-      setStatusMessage(
-        `Queued ${data.enqueued_count} file${data.enqueued_count > 1 ? 's' : ''} for automatic AI scanning!`
-      );
     } catch (err: unknown) {
-      setErrorMsg(err instanceof Error ? err.message : 'Could not upload media');
-      setStatusMessage(null);
+      if (isMountedRef.current) {
+        const reason = err instanceof Error ? err.message : 'Could not upload media';
+        setErrorMsg(
+          totalQueued > 0
+            ? `Queued ${totalQueued}/${files.length} file${totalQueued > 1 ? 's' : ''}, then failed: ${reason}`
+            : reason
+        );
+        setStatusMessage(null);
+      }
     } finally {
-      setIsUploading(false);
+      activeXhrRef.current = null;
+      isUploadingRef.current = false;
+      if (isMountedRef.current) {
+        setIsUploading(false);
+        setUploadProgress(null);
+      }
+      void fetchQueue();
     }
   };
 
@@ -153,22 +445,30 @@ export const MobileQrUploadPage: React.FC = () => {
               name="files"
               type="file"
               multiple
-              accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-msvideo,video/webm,video/x-matroska,application/zip,.jpg,.jpeg,.png,.webp,.mp4,.mov,.avi,.webm,.mkv,.zip"
+              disabled={isUploading}
+              accept="image/*,video/*,application/zip,.jpg,.jpeg,.png,.webp,.bmp,.heic,.heif,.jfif,.mp4,.mov,.avi,.webm,.mkv,.m4v,.zip"
               onChange={(e) => {
-                enqueueFiles(e.target.files);
+                const picked = e.target.files ? Array.from(e.target.files) : [];
                 e.target.value = '';
+                if (picked.length > 0) {
+                  void enqueueFiles(picked);
+                }
               }}
               className="visually-hidden"
             />
             <label
               htmlFor={galleryInputId}
               style={{ minHeight: '54px', fontSize: 'max(1rem, 1em)' }}
-              className="flex w-full items-center justify-center gap-2.5 rounded-xl bg-sky-500 px-4 py-3.5 font-mono-tabular font-bold text-slate-950 shadow-[0_0_24px_rgba(56,189,248,0.25)] transition hover:bg-sky-400 cursor-pointer"
+              className={`flex w-full items-center justify-center gap-2.5 rounded-xl px-4 py-3.5 font-mono-tabular font-bold text-slate-950 shadow-[0_0_24px_rgba(56,189,248,0.25)] transition ${
+                isUploading
+                  ? 'bg-sky-500/80 cursor-wait'
+                  : 'bg-sky-500 hover:bg-sky-400 cursor-pointer'
+              }`}
             >
               {isUploading ? (
                 <>
                   <Loader2 className="h-5 w-5 animate-spin" />
-                  <span>UPLOADING TO QUEUE...</span>
+                  <span>{uploadProgress || 'UPLOADING TO QUEUE...'}</span>
                 </>
               ) : (
                 <>
@@ -183,22 +483,40 @@ export const MobileQrUploadPage: React.FC = () => {
               id={cameraInputId}
               name="camera_file"
               type="file"
+              disabled={isUploading}
               capture="environment"
               accept="image/*,video/*"
               onChange={(e) => {
-                enqueueFiles(e.target.files);
+                const picked = e.target.files ? Array.from(e.target.files) : [];
                 e.target.value = '';
+                if (picked.length > 0) {
+                  void enqueueFiles(picked);
+                }
               }}
               className="visually-hidden"
             />
             <label
               htmlFor={cameraInputId}
               style={{ minHeight: '52px', fontSize: 'max(1rem, 1em)' }}
-              className="flex w-full items-center justify-center gap-2.5 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 font-mono-tabular font-bold text-slate-100 transition hover:border-sky-400/50 hover:text-sky-300 cursor-pointer"
+              className={`flex w-full items-center justify-center gap-2.5 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 font-mono-tabular font-bold text-slate-100 transition ${
+                isUploading
+                  ? 'opacity-60 cursor-wait'
+                  : 'hover:border-sky-400/50 hover:text-sky-300 cursor-pointer'
+              }`}
             >
               <Camera className="h-5 w-5 text-sky-400" />
               <span>TAKE CAMERA PHOTO / VIDEO</span>
             </label>
+
+            {isUploading && (
+              <button
+                type="button"
+                onClick={cancelActiveUpload}
+                className="flex w-full items-center justify-center rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-2.5 font-mono-tabular text-xs font-bold text-rose-300 transition hover:bg-rose-500/20 cursor-pointer"
+              >
+                CANCEL CURRENT UPLOAD
+              </button>
+            )}
           </form>
 
           {/* Accessible Live Feedback Banner */}
@@ -285,8 +603,9 @@ export const MobileQrUploadPage: React.FC = () => {
                           }`}
                         >
                           <CheckCircle2 className="h-3 w-3" />
-                          {ev.primary_target === 'None' ? 'CLEAR' : ev.primary_target} (
-                          {Math.round(ev.confidence * 100)}%)
+                          {ev.primary_target === 'None'
+                            ? 'CLEAR'
+                            : `${ev.primary_target} (${Math.round(ev.confidence * 100)}%)`}
                         </span>
                       )}
                       {job.status === 'failed' && (

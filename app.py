@@ -5,6 +5,7 @@ os.environ["YOLO_OFFLINE"] = "true"
 os.environ["ULTRALYTICS_OFFLINE"] = "1"
 
 import glob
+import math
 import uuid
 import time
 import sqlite3
@@ -23,6 +24,10 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import event as sa_event, Index
 from ultralytics import YOLO
 import torch
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_DIST = os.path.join(BASE_DIR, "frontend", "dist")
@@ -51,9 +56,61 @@ with app.app_context():
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.execute("PRAGMA temp_store=MEMORY")
         cursor.execute("PRAGMA cache_size=-64000")
         cursor.close()
+
+
+def _safe_int(value, default: int, min_v=None, max_v=None) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except Exception:
+        return default
+    if min_v is not None:
+        parsed = max(min_v, parsed)
+    if max_v is not None:
+        parsed = min(max_v, parsed)
+    return parsed
+
+
+def _safe_float(value, default: float, min_v=None, max_v=None) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return default
+    if math.isnan(parsed) or math.isinf(parsed):
+        return default
+    if min_v is not None:
+        parsed = max(min_v, parsed)
+    if max_v is not None:
+        parsed = min(max_v, parsed)
+    return parsed
+
+
+def _safe_remove_file(path: str | None):
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _decode_image_bgr(filepath: str):
+    img = cv2.imread(filepath)
+    if img is not None:
+        return img
+    if Image is not None:
+        try:
+            with Image.open(filepath) as pil_img:
+                rgb = pil_img.convert("RGB")
+                arr = np.array(rgb)
+                return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        except Exception:
+            pass
+    return None
 
 
 class DeterrentEvent(db.Model):
@@ -167,25 +224,31 @@ with app.app_context():
     db.create_all()
     migrate_v3_database_if_needed()
     # Ensure any logged event containing a Human (class_id == 3) overrides to SAFE
-    for ev in DeterrentEvent.query.all():
+    _modified_safe = False
+    for ev in DeterrentEvent.query.filter(DeterrentEvent.primary_target != "SAFE").all():
         try:
             dets = json.loads(ev.detections_json) if ev.detections_json else []
             safe_dets = [d for d in dets if d.get("class_id") == 3]
-            if safe_dets and ev.primary_target != "SAFE":
+            if safe_dets:
                 ev.primary_target = "SAFE"
                 ev.action_taken = "SAFE Alert — Human Verified (0 Deterrents)"
                 ev.actuators_json = "[]"
                 ev.sound_duration_ms = 0
                 ev.confidence = max((float(d.get("confidence", 0.0)) for d in safe_dets), default=ev.confidence)
-                db.session.commit()
+                _modified_safe = True
         except Exception:
             pass
+    if _modified_safe:
+        db.session.commit()
 
 # ==============================================================================
 # HARDWARE ACCELERATION & 100% OFFLINE DUAL-MODEL YOLO CASCADE
 # ==============================================================================
+import importlib.util
+
 device = 0 if torch.cuda.is_available() else "cpu"
 _inference_lock = threading.Lock()
+_has_tensorrt = importlib.util.find_spec("tensorrt") is not None
 
 best_weights = None
 if os.environ.get("MODEL_PATH") and os.path.exists(os.environ.get("MODEL_PATH")):
@@ -193,12 +256,13 @@ if os.environ.get("MODEL_PATH") and os.path.exists(os.environ.get("MODEL_PATH"))
 
 if not best_weights:
     candidates = [
-        os.path.join(BASE_DIR, "best.engine"),
         r"C:\wildlife_yolo\runs\y11m_4class_orin\weights\best.pt",
         os.path.join(BASE_DIR, "best.pt"),
         os.path.join(BASE_DIR, "deploy_package", "best.pt"),
         os.path.join(BASE_DIR, "weights", "best.pt"),
     ]
+    if _has_tensorrt:
+        candidates.insert(0, os.path.join(BASE_DIR, "best.engine"))
     for c in candidates:
         if os.path.exists(c):
             best_weights = c
@@ -214,10 +278,11 @@ primary_model = YOLO(best_weights)
 # Load Local Prebuilt COCO Model (yolo11n.pt) strictly from local disk (Zero Internet Required)
 coco_verifier = None
 coco_candidates = [
-    os.path.join(BASE_DIR, "yolo11n.engine"),
     os.path.join(BASE_DIR, "yolo11n.pt"),
     os.path.join(BASE_DIR, "deploy_package", "yolo11n.pt"),
 ]
+if _has_tensorrt:
+    coco_candidates.insert(0, os.path.join(BASE_DIR, "yolo11n.engine"))
 for cc in coco_candidates:
     if os.path.exists(cc):
         try:
@@ -268,6 +333,158 @@ def compute_iou(box_a, box_b):
     area_a = max(1.0, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
     area_b = max(1.0, (box_b[2] - box_b[0]) * (box_b[3] - box_b[1]))
     return inter_area / float(area_a + area_b - inter_area)
+
+
+def compute_iomin(box_a, box_b):
+    """Intersection area divided by the smaller box area (catches nested/contained duplicates)."""
+    x_a = max(box_a[0], box_b[0])
+    y_a = max(box_a[1], box_b[1])
+    x_b = min(box_a[2], box_b[2])
+    y_b = min(box_a[3], box_b[3])
+    inter_w = max(0.0, x_b - x_a)
+    inter_h = max(0.0, y_b - y_a)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(1.0, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
+    area_b = max(1.0, (box_b[2] - box_b[0]) * (box_b[3] - box_b[1]))
+    return inter_area / float(min(area_a, area_b))
+
+
+def _box_area(bbox):
+    return max(1.0, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+
+
+def deduplicate_detections(detections, iou_thresh=0.45, iomin_thresh=0.78):
+    """
+    Cross-class & containment NMS:
+      - Prioritizes SAFE (Human, class 3) first, then descending confidence.
+      - Suppresses cross-class or same-class duplicate boxes when IoU >= iou_thresh.
+      - For animal threat boxes (0, 1, 2) with IoMin >= iomin_thresh, keeps one box per target
+        and swaps in a tighter inner box if it covers < 65% of the outer area with similar confidence.
+    """
+    if len(detections) <= 1:
+        return list(detections)
+
+    ordered = sorted(
+        detections,
+        key=lambda d: (0 if d["class_id"] == 3 else 1, -float(d["confidence"])),
+    )
+    kept = []
+    for det in ordered:
+        det_area = _box_area(det["bbox"])
+        suppressed = False
+        for i, prev in enumerate(kept):
+            if compute_iou(det["bbox"], prev["bbox"]) >= iou_thresh:
+                suppressed = True
+                break
+            if compute_iomin(det["bbox"], prev["bbox"]) >= iomin_thresh:
+                if prev["class_id"] in (0, 1, 2) and det["class_id"] in (0, 1, 2):
+                    prev_area = _box_area(prev["bbox"])
+                    if (
+                        det_area < 0.65 * prev_area
+                        and float(det["confidence"]) >= float(prev["confidence"]) - 0.08
+                    ):
+                        kept[i] = det
+                    suppressed = True
+                    break
+                if prev["class_id"] == det["class_id"]:
+                    suppressed = True
+                    break
+        if not suppressed:
+            kept.append(det)
+    return kept
+
+
+def _build_detection(cls_id, conf, xyxy, w_img, h_img, subtype=None):
+    class_name = SENTINEL_CLASS_NAMES.get(cls_id, "SMALL MAMMAL")
+    sub = subtype or class_name.lower()
+    display_label = f"{class_name} {int(round(conf * 100))}%"
+    return {
+        "class_id": cls_id,
+        "class_name": class_name,
+        "subtype": sub,
+        "display_label": display_label,
+        "confidence": round(conf, 4),
+        "bbox": [round(v, 1) for v in xyxy],
+        "bbox_norm": [
+            round(xyxy[0] / w_img, 4),
+            round(xyxy[1] / h_img, 4),
+            round(xyxy[2] / w_img, 4),
+            round(xyxy[3] / h_img, 4),
+        ],
+    }
+
+
+def _finalize_candidate_detection(img_bgr, p_cls, p_conf, p_xyxy, coco_detections, conf_thresh, h_img, w_img):
+    best_iou = 0.0
+    best_coco = None
+    for cd in coco_detections:
+        iou = compute_iou(p_xyxy, cd["xyxy"])
+        if iou > best_iou:
+            best_iou = iou
+            best_coco = cd
+
+    resolved_cls = p_cls
+    resolved_conf = p_conf
+    subtype = SENTINEL_CLASS_NAMES.get(p_cls, "UNKNOWN").lower()
+
+    if best_coco is not None and best_iou >= 0.30:
+        best_coco["matched"] = True
+        c_s_cls = best_coco["sentinel_cls"]
+        c_sub = best_coco["subtype"]
+        c_conf = best_coco["conf"]
+
+        if p_cls == 3:
+            # 'safe' box from primary model: ONLY keep as SAFE if COCO confirms human (person)!
+            if c_s_cls == 3:
+                resolved_cls = 3
+                resolved_conf = max(p_conf, c_conf)
+                subtype = "human"
+            else:
+                # COCO explicitly says it's a cat, dog, bird, or mammal -> Override to threat class!
+                resolved_cls = c_s_cls if c_s_cls in (0, 1, 2) else 1
+                resolved_conf = max(p_conf, c_conf)
+                subtype = f"{c_sub}"
+        else:
+            # Primary predicted a wildlife class (0, 1, or 2)
+            if c_s_cls == 3 and c_conf >= 0.40:
+                # COCO confirmed a Human (person) -> Override box to SAFE!
+                resolved_cls = 3
+                resolved_conf = max(p_conf, c_conf)
+                subtype = "human"
+            elif c_sub in ("cat", "dog"):
+                # Pets are strictly SMALL MAMMAL (Class 1)
+                resolved_cls = 1
+                resolved_conf = max(p_conf, c_conf)
+                subtype = c_sub
+            elif c_s_cls == p_cls:
+                resolved_conf = max(p_conf, c_conf)
+                subtype = c_sub
+    else:
+        # No full-frame COCO match
+        if p_cls == 3:
+            # Verify crop directly; if neither human nor animal is in crop, discard background false positive
+            is_human, override_cls, sub = verify_crop_with_coco(img_bgr, p_xyxy, conf_thresh=conf_thresh)
+            if is_human:
+                resolved_cls = 3
+                subtype = "human"
+            elif override_cls is not None:
+                resolved_cls = override_cls
+                subtype = sub
+            else:
+                return None
+        elif p_cls == 1:
+            # Reject tall vertical wall/partition false positives when unconfirmed by COCO
+            box_w = max(1.0, p_xyxy[2] - p_xyxy[0])
+            box_h = max(1.0, p_xyxy[3] - p_xyxy[1])
+            if (box_h / float(h_img)) > 0.80 and (box_h / box_w) > 1.65:
+                return None
+
+    if resolved_conf < conf_thresh:
+        return None
+
+    return _build_detection(resolved_cls, resolved_conf, p_xyxy, w_img, h_img, subtype=subtype)
 
 
 def verify_crop_with_coco(img_bgr, xyxy, conf_thresh=0.50):
@@ -342,9 +559,20 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.50):
             source=img_bgr,
             save=False,
             device=device,
-            conf=conf_thresh,
+            conf=min(0.18, conf_thresh),
             verbose=False,
         )[0]
+
+        strong_boxes = []
+        weak_proposals = []
+        for pbox in primary_res.boxes:
+            p_cls = int(pbox.cls[0].item())
+            p_conf = float(pbox.conf[0].item())
+            p_xyxy = [float(v) for v in pbox.xyxy[0].tolist()]
+            if p_conf >= conf_thresh:
+                strong_boxes.append((p_cls, p_conf, p_xyxy))
+            else:
+                weak_proposals.append((p_cls, p_conf, p_xyxy))
 
         coco_detections = []
         if coco_verifier is not None:
@@ -375,126 +603,72 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.50):
                 print(f"[AI] Secondary verifier error: {e}")
 
         final_detections = []
-        for pbox in primary_res.boxes:
-            p_cls = int(pbox.cls[0].item())
-            p_conf = float(pbox.conf[0].item())
-            p_xyxy = [float(v) for v in pbox.xyxy[0].tolist()]
-
-            # Find highest-IoU COCO box
-            best_iou = 0.0
-            best_coco = None
-            for cd in coco_detections:
-                iou = compute_iou(p_xyxy, cd["xyxy"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_coco = cd
-
-            resolved_cls = p_cls
-            resolved_conf = p_conf
-            subtype = SENTINEL_CLASS_NAMES.get(p_cls, "UNKNOWN").lower()
-
-            if best_coco is not None and best_iou >= 0.30:
-                best_coco["matched"] = True
-                c_s_cls = best_coco["sentinel_cls"]
-                c_sub = best_coco["subtype"]
-                c_conf = best_coco["conf"]
-
-                if p_cls == 3:
-                    # 'safe' box from primary model: ONLY keep as SAFE if COCO confirms human (person)!
-                    if c_s_cls == 3:
-                        resolved_cls = 3
-                        resolved_conf = max(p_conf, c_conf)
-                        subtype = "human"
-                    else:
-                        # COCO explicitly says it's a cat, dog, bird, or mammal -> Override to threat class!
-                        resolved_cls = c_s_cls if c_s_cls in (0, 1, 2) else 1
-                        resolved_conf = max(p_conf, c_conf)
-                        subtype = f"{c_sub}"
-                else:
-                    # Primary predicted a wildlife class (0, 1, or 2)
-                    if c_s_cls == 3 and c_conf >= 0.40:
-                        # COCO confirmed a Human (person) -> Override box to SAFE!
-                        resolved_cls = 3
-                        resolved_conf = max(p_conf, c_conf)
-                        subtype = "human"
-                    elif c_sub in ("cat", "dog"):
-                        # Pets are strictly SMALL MAMMAL (Class 1)
-                        resolved_cls = 1
-                        resolved_conf = max(p_conf, c_conf)
-                        subtype = c_sub
-                    elif c_s_cls == p_cls:
-                        resolved_conf = max(p_conf, c_conf)
-                        subtype = c_sub
-            else:
-                # No full-frame COCO match
-                if p_cls == 3:
-                    # Verify crop directly; if neither human nor animal is in crop, discard background false positive
-                    is_human, override_cls, sub = verify_crop_with_coco(img_bgr, p_xyxy, conf_thresh=conf_thresh)
-                    if is_human:
-                        resolved_cls = 3
-                        subtype = "human"
-                    elif override_cls is not None:
-                        resolved_cls = override_cls
-                        subtype = sub
-                    else:
-                        continue
-                elif p_cls == 1:
-                    # Reject tall vertical wall/partition false positives when unconfirmed by COCO
-                    box_w = max(1.0, p_xyxy[2] - p_xyxy[0])
-                    box_h = max(1.0, p_xyxy[3] - p_xyxy[1])
-                    if (box_h / float(h_img)) > 0.80 and (box_h / box_w) > 1.65:
-                        continue
-
-            if resolved_conf < conf_thresh:
-                continue
-
-            class_name = SENTINEL_CLASS_NAMES.get(resolved_cls, "SMALL MAMMAL")
-            display_label = f"{class_name} {int(round(resolved_conf * 100))}%"
-
-            final_detections.append({
-                "class_id": resolved_cls,
-                "class_name": class_name,
-                "subtype": subtype,
-                "display_label": display_label,
-                "confidence": round(resolved_conf, 4),
-                "bbox": [round(v, 1) for v in p_xyxy],
-                "bbox_norm": [
-                    round(p_xyxy[0] / w_img, 4),
-                    round(p_xyxy[1] / h_img, 4),
-                    round(p_xyxy[2] / w_img, 4),
-                    round(p_xyxy[3] / h_img, 4),
-                ],
-            })
+        for p_cls, p_conf, p_xyxy in strong_boxes:
+            det = _finalize_candidate_detection(
+                img_bgr, p_cls, p_conf, p_xyxy, coco_detections, conf_thresh, h_img, w_img
+            )
+            if det is not None:
+                final_detections.append(det)
 
         # Add any high-confidence unmatched COCO detections (e.g., domestic cat/dog or person)
         for cd in coco_detections:
             if not cd["matched"] and cd["conf"] >= conf_thresh:
-                # Ensure it doesn't heavily overlap an already added box
                 if any(compute_iou(cd["xyxy"], fd["bbox"]) >= 0.35 for fd in final_detections):
                     continue
-                s_cls = cd["sentinel_cls"]
-                c_name = SENTINEL_CLASS_NAMES.get(s_cls, "SMALL MAMMAL")
-                sub = cd["subtype"]
-                conf = cd["conf"]
-                xyxy = cd["xyxy"]
-                disp = f"{c_name} {int(round(conf * 100))}%"
+                final_detections.append(
+                    _build_detection(
+                        cd["sentinel_cls"],
+                        cd["conf"],
+                        cd["xyxy"],
+                        w_img,
+                        h_img,
+                        subtype=cd["subtype"],
+                    )
+                )
 
-                final_detections.append({
-                    "class_id": s_cls,
-                    "class_name": c_name,
-                    "subtype": sub,
-                    "display_label": disp,
-                    "confidence": round(conf, 4),
-                    "bbox": [round(v, 1) for v in xyxy],
-                    "bbox_norm": [
-                        round(xyxy[0] / w_img, 4),
-                        round(xyxy[1] / h_img, 4),
-                        round(xyxy[2] / w_img, 4),
-                        round(xyxy[3] / h_img, 4),
-                    ],
-                })
+        # Stage 2A: Proposal-Guided Focal Zoom around sub-threshold full-frame candidates
+        if not final_detections and weak_proposals:
+            focal_candidates = [
+                item for item in sorted(weak_proposals, key=lambda x: _box_area(x[2]))
+                if (item[2][2] - item[2][0]) < 0.75 * w_img
+                and (item[2][3] - item[2][1]) < 0.75 * h_img
+            ][:4]
+            for _, _, (bx1, by1, bx2, by2) in focal_candidates:
+                bw = bx2 - bx1
+                bh = by2 - by1
+                cx = (bx1 + bx2) / 2.0
+                cy = (by1 + by2) / 2.0
+                half = max(160.0, max(bw, bh) * 0.95)
+                cx1 = max(0, int(cx - half))
+                cy1 = max(0, int(cy - half))
+                cx2 = min(w_img, int(cx + half))
+                cy2 = min(h_img, int(cy + half))
+                if (cx2 - cx1) < 32 or (cy2 - cy1) < 32:
+                    continue
+                crop_bgr = img_bgr[cy1:cy2, cx1:cx2]
+                if crop_bgr.size == 0:
+                    continue
+                c_res = primary_model.predict(
+                    source=crop_bgr,
+                    save=False,
+                    device=device,
+                    conf=conf_thresh,
+                    verbose=False,
+                )[0]
+                for cb in c_res.boxes:
+                    c_cls = int(cb.cls[0].item())
+                    c_conf = float(cb.conf[0].item())
+                    cbx1, cby1, cbx2, cby2 = [float(v) for v in cb.xyxy[0].tolist()]
+                    full_xyxy = [cx1 + cbx1, cy1 + cby1, cx1 + cbx2, cy1 + cby2]
+                    det = _finalize_candidate_detection(
+                        img_bgr, c_cls, c_conf, full_xyxy, coco_detections, conf_thresh, h_img, w_img
+                    )
+                    if det is not None:
+                        final_detections.append(det)
+                if any(d["class_id"] == 3 for d in final_detections):
+                    break
 
-        # High-resolution multi-crop fallback for uploaded 12MP photos when full-frame 640 misses distant targets
+        # Stage 2B: Distant-target multi-crop fallback for large images when focal zoom finds nothing
         if not final_detections and max(h_img, w_img) >= 1200:
             crop_windows = [
                 (0.20, 0.20, 0.80, 0.80),
@@ -514,7 +688,7 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.50):
                     source=crop_bgr,
                     save=False,
                     device=device,
-                    conf=max(0.30, conf_thresh * 0.68),
+                    conf=conf_thresh,
                     verbose=False,
                 )[0]
                 for cb in c_res.boxes:
@@ -522,26 +696,15 @@ def run_dual_model_cascade(img_bgr, conf_thresh=0.50):
                     c_conf = float(cb.conf[0].item())
                     bx1, by1, bx2, by2 = [float(v) for v in cb.xyxy[0].tolist()]
                     full_xyxy = [cx1 + bx1, cy1 + by1, cx1 + bx2, cy1 + by2]
-                    c_name = SENTINEL_CLASS_NAMES.get(c_cls, "SMALL MAMMAL")
-                    disp = f"{c_name} {int(round(c_conf * 100))}%"
-                    final_detections.append({
-                        "class_id": c_cls,
-                        "class_name": c_name,
-                        "subtype": c_name.lower(),
-                        "display_label": disp,
-                        "confidence": round(c_conf, 4),
-                        "bbox": [round(v, 1) for v in full_xyxy],
-                        "bbox_norm": [
-                            round(full_xyxy[0] / w_img, 4),
-                            round(full_xyxy[1] / h_img, 4),
-                            round(full_xyxy[2] / w_img, 4),
-                            round(full_xyxy[3] / h_img, 4),
-                        ],
-                    })
+                    det = _finalize_candidate_detection(
+                        img_bgr, c_cls, c_conf, full_xyxy, coco_detections, conf_thresh, h_img, w_img
+                    )
+                    if det is not None:
+                        final_detections.append(det)
                 if final_detections:
                     break
 
-    return final_detections
+    return deduplicate_detections(final_detections)
 
 
 # Warm up TensorRT / CUDA models at server startup so Live Camera detects immediately
@@ -553,6 +716,45 @@ try:
     print("[AI] GPU Warmup complete — real-time Live Camera inference ready.")
 except Exception as _warmup_err:
     print(f"[AI] Warmup note: {_warmup_err}")
+
+
+def _rects_overlap(rect_a, rect_b):
+    return not (
+        rect_a[2] <= rect_b[0]
+        or rect_b[2] <= rect_a[0]
+        or rect_a[3] <= rect_b[1]
+        or rect_b[3] <= rect_a[1]
+    )
+
+
+def _clamp_pill(px1, py1, pill_w, pill_h, w_img, h_img):
+    lx1 = max(0, min(w_img - 1 - pill_w, int(px1)))
+    ly1 = max(0, min(h_img - 1 - pill_h, int(py1)))
+    return (lx1, ly1, min(w_img - 1, lx1 + pill_w), min(h_img - 1, ly1 + pill_h))
+
+
+def _place_label_pill(x1, y1, x2, y2, pill_w, pill_h, w_img, h_img, occupied_pills):
+    candidates = [
+        _clamp_pill(x1, y1 - pill_h, pill_w, pill_h, w_img, h_img),
+        _clamp_pill(x1 + 2, y1 + 2, pill_w, pill_h, w_img, h_img),
+        _clamp_pill(x2 - pill_w, y1 - pill_h, pill_w, pill_h, w_img, h_img),
+        _clamp_pill(x1, y2 + 2, pill_w, pill_h, w_img, h_img),
+        _clamp_pill(x1 + 2, y2 - pill_h - 2, pill_w, pill_h, w_img, h_img),
+        _clamp_pill(x1, y1 + pill_h + 6, pill_w, pill_h, w_img, h_img),
+    ]
+    for cand in candidates:
+        if not any(_rects_overlap(cand, prev) for prev in occupied_pills):
+            occupied_pills.append(cand)
+            return cand
+    fallback = candidates[0]
+    for _ in range(4):
+        colliders = [prev for prev in occupied_pills if _rects_overlap(fallback, prev)]
+        if not colliders:
+            break
+        next_y = max(prev[3] + 2 for prev in colliders)
+        fallback = _clamp_pill(fallback[0], next_y, pill_w, pill_h, w_img, h_img)
+    occupied_pills.append(fallback)
+    return fallback
 
 
 def draw_tactical_boxes(img_bgr, detections):
@@ -572,6 +774,8 @@ def draw_tactical_boxes(img_bgr, detections):
         3: (110, 198, 46),   # SAFE (HUMAN): Emerald Green (#2EC66E)
     }
 
+    # Pass 1: draw all bounding boxes and corner brackets first so lines never cut across label pills
+    box_draw_info = []
     for det in detections:
         cls_id = det["class_id"]
         color = colors_bgr.get(cls_id, (255, 182, 56))
@@ -597,23 +801,28 @@ def draw_tactical_boxes(img_bgr, detections):
         # Bottom-right
         cv2.line(canvas, (x2, y2), (x2 - corner_len, y2), color, c_thick)
         cv2.line(canvas, (x2, y2), (x2, y2 - corner_len), color, c_thick)
+        box_draw_info.append((det, cls_id, color, x1, y1, x2, y2))
 
-        # Label pill
+    # Pass 2: draw all non-overlapping label pills cleanly on top
+    occupied_pills = []
+    for det, cls_id, color, x1, y1, x2, y2 in box_draw_info:
         label = det["display_label"]
         font_scale = 0.56 * scale
         font_thick = max(1, int(round(1.8 * scale)))
-        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, font_scale, font_thick)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, font_scale, font_thick)
         pad_x, pad_y = 8, 6
-        lbl_y1 = max(0, y1 - th - pad_y * 2)
-        lbl_y2 = lbl_y1 + th + pad_y * 2
-        lbl_x2 = min(w_img - 1, x1 + tw + pad_x * 2)
+        pill_w = min(max(1, w_img - 1), tw + pad_x * 2)
+        pill_h = min(max(1, h_img - 1), th + pad_y * 2)
+        lbl_x1, lbl_y1, lbl_x2, lbl_y2 = _place_label_pill(
+            x1, y1, x2, y2, pill_w, pill_h, w_img, h_img, occupied_pills
+        )
 
-        cv2.rectangle(canvas, (x1, lbl_y1), (lbl_x2, lbl_y2), color, -1)
+        cv2.rectangle(canvas, (lbl_x1, lbl_y1), (lbl_x2, lbl_y2), color, -1)
         text_color = (10, 14, 20) if cls_id in (0, 1, 3) else (255, 255, 255)
         cv2.putText(
             canvas,
             label,
-            (x1 + pad_x, lbl_y2 - pad_y - 1),
+            (lbl_x1 + pad_x, lbl_y2 - pad_y - 1),
             cv2.FONT_HERSHEY_DUPLEX,
             font_scale,
             text_color,
@@ -622,6 +831,29 @@ def draw_tactical_boxes(img_bgr, detections):
         )
 
     return canvas
+
+
+def _save_image_thumbnail(img_bgr, unique_stem: str, max_dim: int = 360):
+    """Writes a lightweight ~15 KB JPEG thumbnail so mobile/desktop cards do not re-download full-res results."""
+    try:
+        h, w = img_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return None
+        longest = max(w, h)
+        if longest > max_dim:
+            scale = max_dim / float(longest)
+            thumb_w = max(1, int(round(w * scale)))
+            thumb_h = max(1, int(round(h * scale)))
+            thumb_bgr = cv2.resize(img_bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+        else:
+            thumb_bgr = img_bgr
+        thumb_filename = f"thumb_{unique_stem}.jpg"
+        thumb_path = os.path.join(app.config["THUMBNAILS_FOLDER"], thumb_filename)
+        if cv2.imwrite(thumb_path, thumb_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 78]):
+            return thumb_filename
+    except Exception as exc:
+        print(f"[THUMB] Warning generating thumbnail for {unique_stem}: {exc}")
+    return None
 
 
 def evaluate_deterrent_plan(detections):
@@ -708,110 +940,236 @@ def evaluate_deterrent_plan(detections):
 _deterrent_state = {
     "esp32_online": False,
     "esp32_ip": os.environ.get("ESP32_HOST", "192.168.4.1"),
+    "esp32_firmware": "unknown",
     "last_target": "NONE",
-    "active_actuators": [],
-    "trigger_start_epoch": 0.0,
-    "duration_ms": 0,
+    "channel_until": {"SOUND": 0.0, "WATER": 0.0, "LIGHT": 0.0},
+    "channel_duration_ms": {"SOUND": 0, "WATER": 0, "LIGHT": 0},
     "last_live_trigger_epoch": 0.0,
+    "cmd_seq": 0,
 }
 _state_lock = threading.Lock()
+_esp32_cmd_queue: "queue.Queue[tuple[int, str, int, list[str]]]" = queue.Queue()
+
+
+def _recompute_active_channels_locked(now: float):
+    active = []
+    channels = {}
+    max_rem_ms = 0
+    max_dur_ms = 0
+    for ch in ("SOUND", "WATER", "LIGHT"):
+        rem = max(0, int((_deterrent_state["channel_until"].get(ch, 0.0) - now) * 1000))
+        channels[ch] = rem
+        if rem > 0:
+            active.append(ch)
+            if rem > max_rem_ms:
+                max_rem_ms = rem
+            dur = int(_deterrent_state["channel_duration_ms"].get(ch, 0))
+            if dur > max_dur_ms:
+                max_dur_ms = dur
+        else:
+            _deterrent_state["channel_duration_ms"][ch] = 0
+    if max_rem_ms > 0 and max_dur_ms < max_rem_ms:
+        max_dur_ms = max_rem_ms
+    return active, channels, max_rem_ms, max_dur_ms
 
 
 def get_active_deterrent_telemetry():
     with _state_lock:
         now = time.time()
-        elapsed_ms = int((now - _deterrent_state["trigger_start_epoch"]) * 1000)
-        total_ms = _deterrent_state["duration_ms"]
-        if total_ms > 0 and elapsed_ms < total_ms:
-            remaining_ms = total_ms - elapsed_ms
-            active_actuators = list(_deterrent_state["active_actuators"])
-            is_active = True
-        else:
-            remaining_ms = 0
-            total_ms = 0
-            active_actuators = []
-            is_active = False
-
+        active_actuators, channels, remaining_ms, total_ms = _recompute_active_channels_locked(now)
+        is_active = len(active_actuators) > 0
         return {
             "esp32_online": _deterrent_state["esp32_online"],
             "esp32_ip": _deterrent_state["esp32_ip"],
+            "esp32_firmware": _deterrent_state["esp32_firmware"],
             "is_active": is_active,
             "last_target": _deterrent_state["last_target"],
             "active_actuators": active_actuators,
-            "duration_ms": total_ms,
-            "remaining_ms": remaining_ms,
+            "channels": channels,
+            "duration_ms": total_ms if is_active else 0,
+            "remaining_ms": remaining_ms if is_active else 0,
         }
+
+
+def _esp32_send_http(seq: int, animal_token: str, duration_ms: int, actuators: list[str]):
+    token_upper = str(animal_token).upper().strip()
+    is_stop = token_upper in ("STOP", "OFF", "SAFE", "HUMAN")
+    payload_dict = {
+        "animal": str(animal_token),
+        "duration": str(int(duration_ms)) if duration_ms > 0 else "0",
+    }
+    payload_bytes = json.dumps(payload_dict).encode("utf-8")
+    hosts = [
+        os.environ.get("ESP32_HOST", "192.168.4.1"),
+        "esp32.local",
+    ]
+    for host in hosts:
+        if not host:
+            continue
+        q_animal = urllib.parse.quote(str(animal_token))
+        q_dur = int(duration_ms)
+        url = f"http://{host}/command?animal={q_animal}&duration={q_dur}" if q_dur > 0 else f"http://{host}/command?animal={q_animal}"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    "Connection": "close",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=1.2) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+                resp_json = {}
+                try:
+                    resp_json = json.loads(body)
+                    esp_dur = int(resp_json.get("duration_ms", duration_ms) or duration_ms)
+                except Exception:
+                    esp_dur = duration_ms
+
+                pump_dur = int(resp_json.get("pump_duration_ms", 0) or 0)
+                led_dur = int(resp_json.get("led_duration_ms", 0) or 0)
+                buz_dur = int(resp_json.get("buzzer_duration_ms", esp_dur) or esp_dur)
+                fw = str(resp_json.get("firmware") or "pre-v2.3-unsynced")
+
+                now = time.time()
+                with _state_lock:
+                    _deterrent_state["esp32_online"] = True
+                    _deterrent_state["esp32_ip"] = host
+                    _deterrent_state["esp32_firmware"] = fw
+                    # Only apply optimistic duration correction if no newer command (especially STOP) superseded this seq
+                    if not is_stop and _deterrent_state["cmd_seq"] == seq:
+                        if token_upper.startswith("WATER") or token_upper.startswith("PUMP"):
+                            if pump_dur > 0:
+                                _deterrent_state["channel_until"]["WATER"] = now + (pump_dur / 1000.0)
+                                _deterrent_state["channel_duration_ms"]["WATER"] = pump_dur
+                        elif token_upper.startswith("LIGHT") or token_upper.startswith("LED"):
+                            if led_dur > 0:
+                                _deterrent_state["channel_until"]["LIGHT"] = now + (led_dur / 1000.0)
+                                _deterrent_state["channel_duration_ms"]["LIGHT"] = led_dur
+                        elif token_upper.startswith("SOUND") or token_upper.startswith("BUZZER"):
+                            if buz_dur > 0:
+                                _deterrent_state["channel_until"]["SOUND"] = now + (buz_dur / 1000.0)
+                                _deterrent_state["channel_duration_ms"]["SOUND"] = buz_dur
+                        else:
+                            for ch in actuators:
+                                ch_dur = esp_dur
+                                if ch == "WATER" and pump_dur > 0:
+                                    ch_dur = pump_dur
+                                elif ch == "LIGHT" and led_dur > 0:
+                                    ch_dur = led_dur
+                                if ch_dur > 0:
+                                    _deterrent_state["channel_until"][ch] = now + (ch_dur / 1000.0)
+                                    _deterrent_state["channel_duration_ms"][ch] = ch_dur
+                print(
+                    f"[ESP32 HTTP] >>> Triggered '{animal_token}' "
+                    f"(total={esp_dur}ms, pump={pump_dur}ms, led={led_dur}ms, fw={fw}) "
+                    f"at {host} (HTTP {resp.status}) <<<",
+                    flush=True,
+                )
+                if token_upper.startswith("LARGE") and pump_dur > 0 and pump_dur != esp_dur:
+                    print(
+                        f"[ESP32 WARN] Pump duration mismatch ({pump_dur}ms != {esp_dur}ms, fw={fw}) "
+                        f"— reflash ESP32 with latest v2.4-safe firmware!",
+                        flush=True,
+                    )
+                return
+        except Exception:
+            pass
+
+    with _state_lock:
+        _deterrent_state["esp32_online"] = False
+    print(
+        f"[ESP32 INFO] Node 192.168.4.1 unreachable (Simulated telemetry active on dashboard).",
+        flush=True,
+    )
+
+
+def _esp32_command_worker():
+    while True:
+        seq, animal_token, duration_ms, actuators = _esp32_cmd_queue.get()
+        try:
+            with _state_lock:
+                latest_seq = _deterrent_state["cmd_seq"]
+            token_upper = str(animal_token).upper().strip()
+            # If STOP is newer, skip obsolete pre-STOP trigger commands so SAFE always wins
+            if seq < latest_seq and token_upper not in ("STOP", "OFF", "SAFE", "HUMAN"):
+                continue
+            _esp32_send_http(seq, animal_token, duration_ms, actuators)
+        except Exception as exc:
+            print(f"[ESP32 CMD WORKER] Error: {exc}", flush=True)
+        finally:
+            _esp32_cmd_queue.task_done()
+
+
+_esp32_cmd_thread = threading.Thread(target=_esp32_command_worker, daemon=True)
+_esp32_cmd_thread.start()
 
 
 def dispatch_esp32_command(animal_token, duration_ms=0, actuators=None):
     """
-    Dispatches a low-latency HTTP command to the ESP32 SoftAP (192.168.4.1)
-    and updates local real-time actuator telemetry for the dashboard.
+    Queues a serialized low-latency HTTP command to the ESP32 SoftAP (192.168.4.1)
+    and updates per-channel local real-time actuator telemetry for the dashboard.
     """
     if actuators is None:
         actuators = []
 
+    token_upper = str(animal_token).upper().strip()
+    is_stop = token_upper in ("STOP", "OFF", "SAFE", "HUMAN")
+    is_single_test = (
+        token_upper.startswith("WATER")
+        or token_upper.startswith("PUMP")
+        or token_upper.startswith("LIGHT")
+        or token_upper.startswith("LED")
+        or token_upper.startswith("SOUND")
+        or token_upper.startswith("BUZZER")
+    )
+
+    now = time.time()
+    dur_val = max(0, int(duration_ms))
+
     with _state_lock:
-        if animal_token in ("STOP", "OFF"):
-            _deterrent_state["active_actuators"] = []
-            _deterrent_state["duration_ms"] = 0
-            _deterrent_state["trigger_start_epoch"] = 0.0
+        _deterrent_state["cmd_seq"] += 1
+        seq = _deterrent_state["cmd_seq"]
+        if is_stop:
+            _deterrent_state["last_target"] = "STOP"
+            for ch in ("SOUND", "WATER", "LIGHT"):
+                _deterrent_state["channel_until"][ch] = 0.0
+                _deterrent_state["channel_duration_ms"][ch] = 0
+        elif is_single_test:
+            _deterrent_state["last_target"] = animal_token
+            until = now + (dur_val / 1000.0) if dur_val > 0 else 0.0
+            for ch in actuators:
+                if ch in _deterrent_state["channel_until"]:
+                    _deterrent_state["channel_until"][ch] = until
+                    _deterrent_state["channel_duration_ms"][ch] = dur_val
         else:
             _deterrent_state["last_target"] = animal_token
-            _deterrent_state["active_actuators"] = list(actuators)
-            _deterrent_state["duration_ms"] = int(duration_ms)
-            _deterrent_state["trigger_start_epoch"] = time.time()
+            until = now + (dur_val / 1000.0) if dur_val > 0 else 0.0
+            for ch in ("SOUND", "WATER", "LIGHT"):
+                if ch in actuators:
+                    _deterrent_state["channel_until"][ch] = until
+                    _deterrent_state["channel_duration_ms"][ch] = dur_val
+                else:
+                    _deterrent_state["channel_until"][ch] = 0.0
+                    _deterrent_state["channel_duration_ms"][ch] = 0
 
-    def _worker():
-        # Send both query params and stringified JSON duration for 100% compatibility
-        payload_dict = {
-            "animal": str(animal_token),
-            "duration": str(int(duration_ms)) if duration_ms > 0 else "0",
-        }
-        payload_bytes = json.dumps(payload_dict).encode("utf-8")
-        hosts = [
-            os.environ.get("ESP32_HOST", "192.168.4.1"),
-            "esp32.local",
-        ]
-        for host in hosts:
-            if not host:
-                continue
-            q_animal = urllib.parse.quote(str(animal_token))
-            q_dur = int(duration_ms)
-            url = f"http://{host}/command?animal={q_animal}&duration={q_dur}" if q_dur > 0 else f"http://{host}/command?animal={q_animal}"
+    if is_stop:
+        # Drain pending non-stop triggers in queue so STOP executes immediately
+        drained = []
+        while True:
             try:
-                req = urllib.request.Request(
-                    url,
-                    data=payload_bytes,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Connection": "keep-alive",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=1.2) as resp:
-                    body = resp.read().decode("utf-8", errors="ignore")
-                    try:
-                        resp_json = json.loads(body)
-                        esp_dur = int(resp_json.get("duration_ms", duration_ms) or duration_ms)
-                    except Exception:
-                        esp_dur = duration_ms
+                queued_item = _esp32_cmd_queue.get_nowait()
+                _esp32_cmd_queue.task_done()
+                if str(queued_item[1]).upper().strip() in ("STOP", "OFF", "SAFE", "HUMAN"):
+                    drained.append(queued_item)
+            except queue.Empty:
+                break
+        for d_item in drained:
+            _esp32_cmd_queue.put(d_item)
 
-                    with _state_lock:
-                        _deterrent_state["esp32_online"] = True
-                        _deterrent_state["esp32_ip"] = host
-                        if animal_token not in ("STOP", "OFF") and esp_dur > 0:
-                            _deterrent_state["duration_ms"] = esp_dur
-                    print(f"[ESP32 HTTP] >>> Triggered '{animal_token}' ({esp_dur} ms) at {host} (HTTP {resp.status}) <<<")
-                    return
-            except Exception:
-                pass
-
-        with _state_lock:
-            _deterrent_state["esp32_online"] = False
-        print(f"[ESP32 INFO] Node 192.168.4.1 unreachable (Simulated telemetry active on dashboard).")
-
-    threading.Thread(target=_worker, daemon=True).start()
+    _esp32_cmd_queue.put((seq, str(animal_token), dur_val, list(actuators)))
 
 
 THREAT_TOKEN_RANK = {"BIRD": 1, "SMALL": 2, "LARGE": 3}
@@ -823,13 +1181,13 @@ _live_temporal_state = {
 }
 
 
-def sync_deterrents_with_plan(plan):
+def sync_deterrents_with_plan(plan, force_trigger: bool = False):
     """
     Enforces strict real-time hardware deterrent rules for both Live Camera and Video:
       1. If a Human ('SAFE') is on screen -> STOP deterrents immediately.
       2. If NO 'SAFE' is detected on screen and an Animal ('BIRD', 'SMALL MAMMAL', 'LARGE MAMMAL')
          is detected -> TURN ON deterrents immediately (or escalate immediately if a higher
-         threat tier appears).
+         threat tier appears, or always fire when force_trigger=True on explicit photo uploads).
     Returns True if a deterrent trigger command was dispatched, False otherwise.
     """
     now = time.time()
@@ -840,14 +1198,11 @@ def sync_deterrents_with_plan(plan):
     if primary_target == "SAFE":
         should_stop = False
         with _state_lock:
-            active_rem = max(
-                0.0,
-                (_deterrent_state["duration_ms"] / 1000.0) - (now - _deterrent_state["trigger_start_epoch"]),
-            )
+            active_channels, _, active_rem_ms, _ = _recompute_active_channels_locked(now)
             if (
-                active_rem > 0.0
-                or len(_deterrent_state["active_actuators"]) > 0
-                or _deterrent_state.get("last_target") not in ("NONE", "STOP", "OFF")
+                active_rem_ms > 0
+                or len(active_channels) > 0
+                or _deterrent_state.get("last_target") not in ("NONE", "STOP", "OFF", "SAFE")
             ):
                 should_stop = True
                 _deterrent_state["last_live_trigger_epoch"] = 0.0
@@ -860,15 +1215,13 @@ def sync_deterrents_with_plan(plan):
     if esp32_token:
         should_fire = False
         with _state_lock:
-            active_rem = max(
-                0.0,
-                (_deterrent_state["duration_ms"] / 1000.0) - (now - _deterrent_state["trigger_start_epoch"]),
-            )
+            active_channels, _, active_rem_ms, _ = _recompute_active_channels_locked(now)
+            active_rem = active_rem_ms / 1000.0
             cur_target = _deterrent_state.get("last_target", "NONE")
             cur_rank = THREAT_TOKEN_RANK.get(cur_target, 0) if active_rem > 0.35 else 0
             new_rank = THREAT_TOKEN_RANK.get(esp32_token, 1)
 
-            if active_rem <= 0.35 or not _deterrent_state["active_actuators"] or new_rank > cur_rank:
+            if force_trigger or active_rem <= 0.35 or not active_channels or new_rank > cur_rank:
                 should_fire = True
                 _deterrent_state["last_live_trigger_epoch"] = now
 
@@ -904,11 +1257,11 @@ def process_uploaded_video(filepath, unique_stem, conf_thresh=0.50):
     max_dim = 960
     if max(width, height) > max_dim:
         scale = max_dim / float(max(width, height))
-        out_w = int(round(width * scale / 2.0) * 2)
-        out_h = int(round(height * scale / 2.0) * 2)
+        out_w = max(2, int(round(width * scale / 2.0) * 2))
+        out_h = max(2, int(round(height * scale / 2.0) * 2))
     else:
-        out_w = width - (width % 2)
-        out_h = height - (height % 2)
+        out_w = max(2, width - (width % 2))
+        out_h = max(2, height - (height % 2))
 
     # Try fast browser-native H.264 MP4 ('avc1') first, then VP8 WebM ('vp80'), then mp4v
     out_filename = f"{unique_stem}.mp4"
@@ -998,10 +1351,7 @@ def process_uploaded_video(filepath, unique_stem, conf_thresh=0.50):
     if duration_sec <= 0 and frame_idx > 0:
         duration_sec = frame_idx / fps
 
-    thumb_filename = f"thumb_{unique_stem}.jpg"
-    thumb_filepath = os.path.join(app.config["THUMBNAILS_FOLDER"], thumb_filename)
-    if peak_frame_bgr is not None:
-        cv2.imwrite(thumb_filepath, peak_frame_bgr)
+    thumb_filename = _save_image_thumbnail(peak_frame_bgr, unique_stem) if peak_frame_bgr is not None else None
 
     # If the video had frames where an animal was detected without a human present,
     # summarize the event with that threat plan; otherwise evaluate all detections.
@@ -1017,7 +1367,7 @@ def process_uploaded_video(filepath, unique_stem, conf_thresh=0.50):
         "duration_sec": round(duration_sec, 2),
         "plan": overall_plan,
         "last_active_plan": last_active_plan or overall_plan,
-        "timeline": timeline_markers[:240],
+        "timeline": timeline_markers[:1800],
         "sample_detections": all_detections_summary[:30],
     }
 
@@ -1030,8 +1380,8 @@ def process_uploaded_video(filepath, unique_stem, conf_thresh=0.50):
 def api_dashboard():
     target_filter = request.args.get("target", "ALL").upper()
     media_filter = request.args.get("media_type", "ALL").lower()
-    page = max(1, int(request.args.get("page", 1)))
-    per_page = min(100, max(6, int(request.args.get("per_page", 24))))
+    page = _safe_int(request.args.get("page", 1), 1, min_v=1, max_v=100000)
+    per_page = _safe_int(request.args.get("per_page", 24), 24, min_v=6, max_v=100)
 
     # Global incursion counts across entire persistent database
     total_scans = DeterrentEvent.query.count()
@@ -1118,17 +1468,121 @@ def api_delete_event(event_id):
 def api_clear_events():
     DeterrentEvent.query.delete()
     db.session.commit()
+
+    protected_uploads: set[str] = set()
+    with _qr_jobs_lock:
+        active_ids = []
+        for jid in _qr_job_order:
+            job = _qr_jobs.get(jid)
+            if not job:
+                continue
+            if job.get("status") in ("queued", "processing"):
+                active_ids.append(jid)
+                p = job.get("saved_upload_path")
+                if p:
+                    protected_uploads.add(os.path.abspath(p))
+            else:
+                _qr_jobs.pop(jid, None)
+        _qr_job_order[:] = active_ids
+
     for folder in [
         app.config["RESULTS_FOLDER"],
         app.config["UPLOAD_FOLDER"],
         app.config["THUMBNAILS_FOLDER"],
     ]:
         for f in glob.glob(os.path.join(folder, "*")):
-            try:
-                os.remove(f)
-            except Exception:
-                pass
+            if os.path.abspath(f) in protected_uploads:
+                continue
+            _safe_remove_file(f)
     return jsonify({"status": "cleared"})
+
+
+ALLOWED_IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp",
+    ".jfif", ".gif", ".tiff", ".tif", ".heic", ".heif",
+}
+ALLOWED_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v", ".3gp"}
+MIMETYPE_EXT_MAP = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/tiff": ".tiff",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/x-msvideo": ".avi",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "video/x-m4v": ".m4v",
+    "video/3gpp": ".3gp",
+    "application/zip": ".zip",
+    "application/x-zip-compressed": ".zip",
+}
+
+MAX_ZIP_IMAGES = 100
+MAX_ZIP_ENTRY_BYTES = 25 * 1024 * 1024
+MAX_ZIP_TOTAL_BYTES = 250 * 1024 * 1024
+
+
+def _resolve_upload_ext(file_storage, allowed_exts: set[str]) -> str:
+    raw_name = (getattr(file_storage, "filename", "") or "").strip()
+    ext = os.path.splitext(raw_name)[1].lower()
+    if ext in allowed_exts:
+        return ext
+    mime = (getattr(file_storage, "mimetype", "") or "").split(";")[0].strip().lower()
+    mapped_ext = MIMETYPE_EXT_MAP.get(mime, "")
+    if mapped_ext in allowed_exts:
+        return mapped_ext
+    if mime.startswith("image/") and ".jpg" in allowed_exts:
+        return ".jpg"
+    if mime.startswith("video/") and ".mp4" in allowed_exts:
+        return ".mp4"
+    return ext
+
+
+def _iter_safe_zip_image_bytes(zip_path: str):
+    total_uncompressed = 0
+    processed_count = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        infos = sorted(zf.infolist(), key=lambda inf: inf.filename)
+        for info in infos:
+            name = info.filename
+            if info.is_dir() or name.endswith("/"):
+                continue
+            base = os.path.basename(name)
+            norm_parts = name.replace("\\", "/").split("/")
+            if "__MACOSX" in norm_parts or base.startswith("._"):
+                continue
+            ext = os.path.splitext(base)[1].lower()
+            if ext not in ALLOWED_IMAGE_EXTS:
+                continue
+            if info.file_size <= 0 or info.file_size > MAX_ZIP_ENTRY_BYTES:
+                continue
+            total_uncompressed += info.file_size
+            if total_uncompressed > MAX_ZIP_TOTAL_BYTES:
+                break
+            if processed_count >= MAX_ZIP_IMAGES:
+                break
+            raw_bytes = zf.read(info)
+            if not raw_bytes:
+                continue
+            arr = np.frombuffer(raw_bytes, np.uint8)
+            img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img_bgr is None and Image is not None:
+                try:
+                    import io
+                    with Image.open(io.BytesIO(raw_bytes)) as pil_img:
+                        img_bgr = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+                except Exception:
+                    img_bgr = None
+            if img_bgr is None:
+                continue
+            processed_count += 1
+            yield base, raw_bytes, img_bgr
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -1136,81 +1590,68 @@ def api_upload():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     file = request.files["file"]
-    if not file or file.filename == "":
+    if not file or (not file.filename and not getattr(file, "mimetype", "")):
         return jsonify({"error": "Empty filename"}), 400
 
     source_mode = request.form.get("source_mode", "upload")  # upload | live_snapshot
-    conf_thresh = max(0.50, float(request.form.get("conf", 0.50)))
+    conf_thresh = _safe_float(request.form.get("conf", 0.50), 0.50, min_v=0.50, max_v=0.99)
 
-    ext = os.path.splitext(file.filename)[1].lower()
-    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+    image_exts = ALLOWED_IMAGE_EXTS
+    video_exts = ALLOWED_VIDEO_EXTS
+    allowed_exts = image_exts | video_exts | {".zip"}
+    ext = _resolve_upload_ext(file, allowed_exts)
 
-    if ext not in image_exts and ext not in video_exts and ext != ".zip":
+    if ext not in allowed_exts:
         return jsonify({"error": f"Unsupported file format '{ext}'. Upload an image, video, or .zip image archive."}), 400
 
     if ext == ".zip":
         zip_path = os.path.join(app.config["UPLOAD_FOLDER"], f"batch_{uuid.uuid4().hex[:8]}.zip")
-        file.save(zip_path)
+        try:
+            file.save(zip_path)
+        except Exception as exc:
+            _safe_remove_file(zip_path)
+            return jsonify({"error": f"Failed to save ZIP archive: {exc}"}), 400
         created_events = []
         try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                entries = sorted(
-                    [
-                        n for n in zf.namelist()
-                        if not n.endswith("/") and os.path.splitext(n)[1].lower() in image_exts
-                    ]
+            for base_name, raw_bytes, img_bgr in _iter_safe_zip_image_bytes(zip_path):
+                item_stem = f"scan_{uuid.uuid4().hex[:8]}"
+                h_img, w_img = img_bgr.shape[:2]
+                detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
+                annotated_bgr = draw_tactical_boxes(img_bgr, detections)
+                plan = evaluate_deterrent_plan(detections)
+                res_fname = f"{item_stem}.jpg"
+                cv2.imwrite(
+                    os.path.join(app.config["RESULTS_FOLDER"], res_fname),
+                    annotated_bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 93],
                 )
-                if not entries:
-                    return jsonify({"error": "ZIP archive contains no supported images."}), 400
-                for entry_name in entries:
-                    raw_bytes = zf.read(entry_name)
-                    if not raw_bytes:
-                        continue
-                    item_ext = os.path.splitext(entry_name)[1].lower()
-                    item_stem = f"scan_{uuid.uuid4().hex[:8]}"
-                    item_upload = os.path.join(app.config["UPLOAD_FOLDER"], f"{item_stem}{item_ext}")
-                    with open(item_upload, "wb") as out_f:
-                        out_f.write(raw_bytes)
-                    img_bgr = cv2.imread(item_upload)
-                    if img_bgr is None:
-                        continue
-                    h_img, w_img = img_bgr.shape[:2]
-                    detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
-                    annotated_bgr = draw_tactical_boxes(img_bgr, detections)
-                    plan = evaluate_deterrent_plan(detections)
-                    res_fname = f"{item_stem}.jpg"
-                    cv2.imwrite(
-                        os.path.join(app.config["RESULTS_FOLDER"], res_fname),
-                        annotated_bgr,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), 93],
-                    )
-                    ev = DeterrentEvent(
-                        filename=res_fname,
-                        thumbnail_filename=None,
-                        media_type="image",
-                        primary_target=plan["primary_target"],
-                        action_taken=plan["action_taken"],
-                        actuators_json=json.dumps(plan["actuators"]),
-                        sound_duration_ms=plan["sound_duration_ms"],
-                        confidence=plan["max_confidence"],
-                        resolution=f"{w_img} x {h_img} px",
-                        file_size_kb=len(raw_bytes) / 1024.0,
-                        video_duration_sec=0.0,
-                        detections_json=json.dumps(detections),
-                        timeline_json="[]",
-                    )
-                    db.session.add(ev)
-                    db.session.flush()
-                    ev_dict = ev.to_dict()
-                    ev_dict["source_name"] = os.path.basename(entry_name)
-                    created_events.append(ev_dict)
+                thumb_fname = _save_image_thumbnail(annotated_bgr, item_stem)
+                ev = DeterrentEvent(
+                    filename=res_fname,
+                    thumbnail_filename=thumb_fname,
+                    media_type="image",
+                    primary_target=plan["primary_target"],
+                    action_taken=plan["action_taken"],
+                    actuators_json=json.dumps(plan["actuators"]),
+                    sound_duration_ms=plan["sound_duration_ms"],
+                    confidence=plan["max_confidence"],
+                    resolution=f"{w_img} x {h_img} px",
+                    file_size_kb=len(raw_bytes) / 1024.0,
+                    video_duration_sec=0.0,
+                    detections_json=json.dumps(detections),
+                    timeline_json="[]",
+                )
+                db.session.add(ev)
+                db.session.flush()
+                ev_dict = ev.to_dict()
+                ev_dict["source_name"] = base_name
+                created_events.append(ev_dict)
+            if created_events:
                 db.session.commit()
+        except zipfile.BadZipFile:
+            return jsonify({"error": "Corrupt or invalid ZIP archive."}), 400
         finally:
-            try:
-                os.remove(zip_path)
-            except Exception:
-                pass
+            _safe_remove_file(zip_path)
 
         if not created_events:
             return jsonify({"error": "No valid images could be decoded from the ZIP archive."}), 400
@@ -1226,84 +1667,92 @@ def api_upload():
     unique_stem = f"scan_{uuid.uuid4().hex[:8]}"
     raw_filename = f"{unique_stem}{ext}"
     upload_path = os.path.join(app.config["UPLOAD_FOLDER"], raw_filename)
-    file.save(upload_path)
-    file_size_kb = os.path.getsize(upload_path) / 1024.0
+    try:
+        file.save(upload_path)
+        file_size_kb = os.path.getsize(upload_path) / 1024.0
+    except Exception as exc:
+        _safe_remove_file(upload_path)
+        return jsonify({"error": f"Upload save failed: {exc}"}), 400
 
-    if ext in image_exts:
-        img_bgr = cv2.imread(upload_path)
-        if img_bgr is None:
-            return jsonify({"error": "Failed to decode uploaded image."}), 400
+    try:
+        if ext in image_exts:
+            img_bgr = _decode_image_bgr(upload_path)
+            if img_bgr is None:
+                return jsonify({"error": f"Failed to decode uploaded image ({ext}). Please use JPG, PNG, or WEBP."}), 400
 
-        h_img, w_img = img_bgr.shape[:2]
-        resolution = f"{w_img} x {h_img} px"
+            h_img, w_img = img_bgr.shape[:2]
+            resolution = f"{w_img} x {h_img} px"
 
-        detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
-        annotated_bgr = draw_tactical_boxes(img_bgr, detections)
-        plan = evaluate_deterrent_plan(detections)
+            detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
+            annotated_bgr = draw_tactical_boxes(img_bgr, detections)
+            plan = evaluate_deterrent_plan(detections)
 
-        result_filename = f"{unique_stem}.jpg"
-        result_path = os.path.join(app.config["RESULTS_FOLDER"], result_filename)
-        cv2.imwrite(result_path, annotated_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
+            result_filename = f"{unique_stem}.jpg"
+            result_path = os.path.join(app.config["RESULTS_FOLDER"], result_filename)
+            cv2.imwrite(result_path, annotated_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
+            thumb_filename = _save_image_thumbnail(annotated_bgr, unique_stem)
 
-        sync_deterrents_with_plan(plan)
+            sync_deterrents_with_plan(plan, force_trigger=True)
 
-        ev = DeterrentEvent(
-            filename=result_filename,
-            thumbnail_filename=None,
-            media_type="live_snapshot" if source_mode == "live_snapshot" else "image",
-            primary_target=plan["primary_target"],
-            action_taken=plan["action_taken"],
-            actuators_json=json.dumps(plan["actuators"]),
-            sound_duration_ms=plan["sound_duration_ms"],
-            confidence=plan["max_confidence"],
-            resolution=resolution,
-            file_size_kb=file_size_kb,
-            video_duration_sec=0.0,
-            detections_json=json.dumps(detections),
-            timeline_json="[]",
-        )
-        db.session.add(ev)
-        db.session.commit()
+            ev = DeterrentEvent(
+                filename=result_filename,
+                thumbnail_filename=thumb_filename,
+                media_type="live_snapshot" if source_mode == "live_snapshot" else "image",
+                primary_target=plan["primary_target"],
+                action_taken=plan["action_taken"],
+                actuators_json=json.dumps(plan["actuators"]),
+                sound_duration_ms=plan["sound_duration_ms"],
+                confidence=plan["max_confidence"],
+                resolution=resolution,
+                file_size_kb=file_size_kb,
+                video_duration_sec=0.0,
+                detections_json=json.dumps(detections),
+                timeline_json="[]",
+            )
+            db.session.add(ev)
+            db.session.commit()
 
-        return jsonify({
-            "status": "success",
-            "event": ev.to_dict(),
-            "telemetry": get_active_deterrent_telemetry(),
-        })
+            return jsonify({
+                "status": "success",
+                "event": ev.to_dict(),
+                "telemetry": get_active_deterrent_telemetry(),
+            })
 
-    else:
-        # Video upload pipeline
-        try:
-            vid_info = process_uploaded_video(upload_path, unique_stem, conf_thresh=conf_thresh)
-        except Exception as e:
-            return jsonify({"error": f"Video processing error: {e}"}), 500
+        else:
+            # Video upload pipeline
+            try:
+                vid_info = process_uploaded_video(upload_path, unique_stem, conf_thresh=conf_thresh)
+            except Exception as e:
+                return jsonify({"error": f"Video processing error: {e}"}), 500
 
-        plan = vid_info["plan"]
-        # Deterrents are triggered live as the video plays inside the auto-opened modal via /api/deterrent/video_sync
+            plan = vid_info["plan"]
+            # Deterrents are triggered live as the video plays inside the auto-opened modal via /api/deterrent/video_sync
 
-        ev = DeterrentEvent(
-            filename=vid_info["out_filename"],
-            thumbnail_filename=vid_info["thumb_filename"],
-            media_type="video",
-            primary_target=plan["primary_target"],
-            action_taken=plan["action_taken"],
-            actuators_json=json.dumps(plan["actuators"]),
-            sound_duration_ms=plan["sound_duration_ms"],
-            confidence=plan["max_confidence"],
-            resolution=vid_info["resolution"],
-            file_size_kb=file_size_kb,
-            video_duration_sec=vid_info["duration_sec"],
-            detections_json=json.dumps(vid_info["sample_detections"]),
-            timeline_json=json.dumps(vid_info["timeline"]),
-        )
-        db.session.add(ev)
-        db.session.commit()
+            ev = DeterrentEvent(
+                filename=vid_info["out_filename"],
+                thumbnail_filename=vid_info["thumb_filename"],
+                media_type="video",
+                primary_target=plan["primary_target"],
+                action_taken=plan["action_taken"],
+                actuators_json=json.dumps(plan["actuators"]),
+                sound_duration_ms=plan["sound_duration_ms"],
+                confidence=plan["max_confidence"],
+                resolution=vid_info["resolution"],
+                file_size_kb=file_size_kb,
+                video_duration_sec=vid_info["duration_sec"],
+                detections_json=json.dumps(vid_info["sample_detections"]),
+                timeline_json=json.dumps(vid_info["timeline"]),
+            )
+            db.session.add(ev)
+            db.session.commit()
 
-        return jsonify({
-            "status": "success",
-            "event": ev.to_dict(),
-            "telemetry": get_active_deterrent_telemetry(),
-        })
+            return jsonify({
+                "status": "success",
+                "event": ev.to_dict(),
+                "telemetry": get_active_deterrent_telemetry(),
+            })
+    finally:
+        _safe_remove_file(upload_path)
 
 
 # ==============================================================================
@@ -1371,8 +1820,10 @@ def _make_qr_matrix(text: str):
         bits.append(0)
     codewords = [sum(bits[i + j] << (7 - j) for j in range(8)) for i in range(0, len(bits), 8)]
     pad_bytes = [0xEC, 0x11]
+    pad_idx = 0
     while len(codewords) < dc:
-        codewords.append(pad_bytes[len(codewords) % 2])
+        codewords.append(pad_bytes[pad_idx % 2])
+        pad_idx += 1
 
     blk_size = dc // nblk
     data_blks, ec_blks = [], []
@@ -1485,7 +1936,7 @@ def generate_qr_svg(text: str, quiet: int = 4) -> str:
     body = "".join(rects)
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {total} {total}" '
-        f'shape-rendering="crispEdges" width="280" height="280">'
+        f'shape-rendering="crispEdges" width="320" height="320">'
         f'<rect width="{total}" height="{total}" fill="#ffffff" rx="1.5"/>'
         f'<g fill="#080c14">{body}</g></svg>'
     )
@@ -1495,6 +1946,33 @@ _qr_upload_queue: "queue.Queue[str]" = queue.Queue()
 _qr_jobs_lock = threading.Lock()
 _qr_jobs: dict[str, dict] = {}
 _qr_job_order: list[str] = []
+
+
+MAX_QR_HISTORY = 120
+
+
+def _escape_wifi_qr_field(val: str) -> str:
+    out = []
+    for ch in str(val):
+        if ch in ("\\", ";", ",", '"', ":"):
+            out.append("\\" + ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _prune_qr_history_locked():
+    while len(_qr_job_order) > MAX_QR_HISTORY:
+        evict_idx = None
+        for idx, jid in enumerate(_qr_job_order):
+            st = _qr_jobs.get(jid, {}).get("status")
+            if st in ("completed", "failed"):
+                evict_idx = idx
+                break
+        if evict_idx is None:
+            break
+        evict_id = _qr_job_order.pop(evict_idx)
+        _qr_jobs.pop(evict_id, None)
 
 
 def _process_single_queued_job(job_id: str):
@@ -1510,15 +1988,15 @@ def _process_single_queued_job(job_id: str):
         unique_stem = job["unique_stem"]
         file_size_kb = job["file_size_kb"]
 
-    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+    image_exts = ALLOWED_IMAGE_EXTS
+    video_exts = ALLOWED_VIDEO_EXTS
 
     try:
         with app.app_context():
             if ext in image_exts:
-                img_bgr = cv2.imread(upload_path)
+                img_bgr = _decode_image_bgr(upload_path)
                 if img_bgr is None:
-                    raise RuntimeError("Failed to decode uploaded image.")
+                    raise RuntimeError(f"Failed to decode uploaded image ({ext}).")
                 h_img, w_img = img_bgr.shape[:2]
                 resolution = f"{w_img} x {h_img} px"
                 detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
@@ -1528,12 +2006,13 @@ def _process_single_queued_job(job_id: str):
                 result_filename = f"{unique_stem}.jpg"
                 result_path = os.path.join(app.config["RESULTS_FOLDER"], result_filename)
                 cv2.imwrite(result_path, annotated_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
+                thumb_filename = _save_image_thumbnail(annotated_bgr, unique_stem)
 
-                sync_deterrents_with_plan(plan)
+                sync_deterrents_with_plan(plan, force_trigger=True)
 
                 ev = DeterrentEvent(
                     filename=result_filename,
-                    thumbnail_filename=None,
+                    thumbnail_filename=thumb_filename,
                     media_type="image",
                     primary_target=plan["primary_target"],
                     action_taken=plan["action_taken"],
@@ -1559,7 +2038,7 @@ def _process_single_queued_job(job_id: str):
             elif ext in video_exts:
                 vid_info = process_uploaded_video(upload_path, unique_stem, conf_thresh=conf_thresh)
                 plan = vid_info["plan"]
-                sync_deterrents_with_plan(plan)
+                sync_deterrents_with_plan(plan, force_trigger=True)
 
                 ev = DeterrentEvent(
                     filename=vid_info["out_filename"],
@@ -1588,62 +2067,41 @@ def _process_single_queued_job(job_id: str):
 
             elif ext == ".zip":
                 created_events = []
-                try:
-                    with zipfile.ZipFile(upload_path, "r") as zf:
-                        entries = sorted(
-                            [
-                                n for n in zf.namelist()
-                                if not n.endswith("/") and os.path.splitext(n)[1].lower() in image_exts
-                            ]
-                        )
-                        if not entries:
-                            raise RuntimeError("ZIP archive contains no supported images.")
-                        for entry_name in entries:
-                            raw_bytes = zf.read(entry_name)
-                            if not raw_bytes:
-                                continue
-                            item_ext = os.path.splitext(entry_name)[1].lower()
-                            item_stem = f"scan_{uuid.uuid4().hex[:8]}"
-                            item_upload = os.path.join(app.config["UPLOAD_FOLDER"], f"{item_stem}{item_ext}")
-                            with open(item_upload, "wb") as out_f:
-                                out_f.write(raw_bytes)
-                            img_bgr = cv2.imread(item_upload)
-                            if img_bgr is None:
-                                continue
-                            h_img, w_img = img_bgr.shape[:2]
-                            detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
-                            annotated_bgr = draw_tactical_boxes(img_bgr, detections)
-                            plan = evaluate_deterrent_plan(detections)
-                            res_fname = f"{item_stem}.jpg"
-                            cv2.imwrite(
-                                os.path.join(app.config["RESULTS_FOLDER"], res_fname),
-                                annotated_bgr,
-                                [int(cv2.IMWRITE_JPEG_QUALITY), 93],
-                            )
-                            ev = DeterrentEvent(
-                                filename=res_fname,
-                                thumbnail_filename=None,
-                                media_type="image",
-                                primary_target=plan["primary_target"],
-                                action_taken=plan["action_taken"],
-                                actuators_json=json.dumps(plan["actuators"]),
-                                sound_duration_ms=plan["sound_duration_ms"],
-                                confidence=plan["max_confidence"],
-                                resolution=f"{w_img} x {h_img} px",
-                                file_size_kb=len(raw_bytes) / 1024.0,
-                                video_duration_sec=0.0,
-                                detections_json=json.dumps(detections),
-                                timeline_json="[]",
-                            )
-                            db.session.add(ev)
-                            db.session.flush()
-                            created_events.append(ev.to_dict())
-                        db.session.commit()
-                finally:
-                    try:
-                        os.remove(upload_path)
-                    except Exception:
-                        pass
+                for base_name, raw_bytes, img_bgr in _iter_safe_zip_image_bytes(upload_path):
+                    item_stem = f"scan_{uuid.uuid4().hex[:8]}"
+                    h_img, w_img = img_bgr.shape[:2]
+                    detections = run_dual_model_cascade(img_bgr, conf_thresh=conf_thresh)
+                    annotated_bgr = draw_tactical_boxes(img_bgr, detections)
+                    plan = evaluate_deterrent_plan(detections)
+                    res_fname = f"{item_stem}.jpg"
+                    cv2.imwrite(
+                        os.path.join(app.config["RESULTS_FOLDER"], res_fname),
+                        annotated_bgr,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 93],
+                    )
+                    thumb_fname = _save_image_thumbnail(annotated_bgr, item_stem)
+                    ev = DeterrentEvent(
+                        filename=res_fname,
+                        thumbnail_filename=thumb_fname,
+                        media_type="image",
+                        primary_target=plan["primary_target"],
+                        action_taken=plan["action_taken"],
+                        actuators_json=json.dumps(plan["actuators"]),
+                        sound_duration_ms=plan["sound_duration_ms"],
+                        confidence=plan["max_confidence"],
+                        resolution=f"{w_img} x {h_img} px",
+                        file_size_kb=len(raw_bytes) / 1024.0,
+                        video_duration_sec=0.0,
+                        detections_json=json.dumps(detections),
+                        timeline_json="[]",
+                    )
+                    db.session.add(ev)
+                    db.session.flush()
+                    ev_dict = ev.to_dict()
+                    ev_dict["source_name"] = base_name
+                    created_events.append(ev_dict)
+                if created_events:
+                    db.session.commit()
 
                 if not created_events:
                     raise RuntimeError("No valid images could be decoded from ZIP.")
@@ -1657,6 +2115,8 @@ def _process_single_queued_job(job_id: str):
             job["status"] = "failed"
             job["completed_at"] = datetime.now().strftime("%H:%M:%S")
             job["error"] = str(err)
+    finally:
+        _safe_remove_file(upload_path)
 
 
 def _qr_queue_worker():
@@ -1674,12 +2134,22 @@ _qr_worker_thread = threading.Thread(target=_qr_queue_worker, daemon=True)
 _qr_worker_thread.start()
 
 
+ESP32_AP_SSID = os.environ.get("ESP32_AP_SSID", "Wildlife-Deterrent-System-AP")
+ESP32_AP_PASS = os.environ.get("ESP32_AP_PASS", "haustein26")
+
+
 def get_qr_queue_snapshot() -> dict:
     lan_ips = _get_local_ipv4_addresses()
+    on_esp32_ap = any(ip.startswith("192.168.4.") for ip in lan_ips)
     if not lan_ips:
         lan_ips = ["192.168.4.2"]
+    elif not on_esp32_ap and "192.168.4.2" not in lan_ips:
+        lan_ips.append("192.168.4.2")
     urls = [f"http://{ip}:5002/qr-upload" for ip in lan_ips]
     primary_url = urls[0]
+    esc_ssid = _escape_wifi_qr_field(ESP32_AP_SSID)
+    esc_pass = _escape_wifi_qr_field(ESP32_AP_PASS)
+    wifi_qr_payload = f"WIFI:T:WPA;S:{esc_ssid};P:{esc_pass};H:false;;"
 
     with _qr_jobs_lock:
         queued_ids = [jid for jid in _qr_job_order if _qr_jobs.get(jid, {}).get("status") == "queued"]
@@ -1721,20 +2191,30 @@ def get_qr_queue_snapshot() -> dict:
         "jobs": jobs_list,
         "network": {
             "ips": lan_ips,
+            "on_esp32_ap": on_esp32_ap,
             "port": 5002,
             "primary_url": primary_url,
             "urls": urls,
+            "wifi_ssid": ESP32_AP_SSID,
+            "wifi_password": ESP32_AP_PASS,
+            "wifi_qr_payload": wifi_qr_payload,
         },
     }
 
 
 @app.route("/api/qr/svg", methods=["GET"])
 def api_qr_svg():
-    target_url = request.args.get("url", "").strip()
-    if not target_url:
-        snap = get_qr_queue_snapshot()
-        target_url = snap["network"]["primary_url"]
-    svg_str = generate_qr_svg(target_url)
+    qr_type = request.args.get("type", "").strip().lower()
+    if qr_type == "wifi":
+        ssid = _escape_wifi_qr_field(request.args.get("ssid", ESP32_AP_SSID).strip() or ESP32_AP_SSID)
+        password = _escape_wifi_qr_field(request.args.get("password", ESP32_AP_PASS).strip())
+        payload = f"WIFI:T:WPA;S:{ssid};P:{password};H:false;;"
+    else:
+        payload = request.args.get("url", "").strip()
+        if not payload:
+            snap = get_qr_queue_snapshot()
+            payload = snap["network"]["primary_url"]
+    svg_str = generate_qr_svg(payload)
     resp = Response(svg_str, mimetype="image/svg+xml")
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
@@ -1742,7 +2222,9 @@ def api_qr_svg():
 
 @app.route("/api/qr/queue", methods=["GET"])
 def api_qr_queue_status():
-    return jsonify(get_qr_queue_snapshot())
+    resp = jsonify(get_qr_queue_snapshot())
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 @app.route("/api/qr/queue/clear", methods=["POST"])
@@ -1761,38 +2243,55 @@ def api_qr_queue_clear():
 
 @app.route("/api/qr/enqueue", methods=["POST"])
 def api_qr_enqueue():
-    uploaded_files = request.files.getlist("files")
-    if not uploaded_files and "file" in request.files:
-        uploaded_files = [request.files["file"]]
+    try:
+        uploaded_files = request.files.getlist("files")
+        if not uploaded_files and "file" in request.files:
+            uploaded_files = [request.files["file"]]
+    except Exception as exc:
+        print(f"[QR-QUEUE] Multipart stream interrupted from {request.remote_addr}: {exc}")
+        return jsonify({"error": f"Upload interrupted before completion: {exc}"}), 400
 
-    valid_files = [f for f in uploaded_files if f and f.filename]
+    valid_files = [f for f in uploaded_files if f and (f.filename or getattr(f, "mimetype", ""))]
     if not valid_files:
         return jsonify({"error": "No media files provided."}), 400
 
-    conf_thresh = max(0.50, float(request.form.get("conf", 0.50)))
+    conf_thresh = _safe_float(request.form.get("conf", 0.50), 0.50, min_v=0.50, max_v=0.99)
     uploader = (request.form.get("uploader") or "Mobile QR Upload").strip()[:48]
 
-    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    video_exts = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+    image_exts = ALLOWED_IMAGE_EXTS
+    video_exts = ALLOWED_VIDEO_EXTS
     allowed_exts = image_exts | video_exts | {".zip"}
 
     enqueued_jobs = []
     for f in valid_files:
-        ext = os.path.splitext(f.filename)[1].lower()
+        raw_name = (f.filename or "").strip()
+        ext = _resolve_upload_ext(f, allowed_exts)
         if ext not in allowed_exts:
             continue
+
+        display_name = os.path.basename(raw_name) if raw_name else f"mobile_upload{ext}"
         unique_stem = f"scan_{uuid.uuid4().hex[:8]}"
         raw_filename = f"{unique_stem}{ext}"
         upload_path = os.path.join(app.config["UPLOAD_FOLDER"], raw_filename)
-        f.save(upload_path)
-        file_size_kb = os.path.getsize(upload_path) / 1024.0
+        try:
+            f.save(upload_path)
+            file_size_kb = os.path.getsize(upload_path) / 1024.0
+        except Exception as exc:
+            print(f"[QR-QUEUE] Save error for '{display_name}' from {request.remote_addr}: {exc}")
+            try:
+                if os.path.exists(upload_path):
+                    os.remove(upload_path)
+            except Exception:
+                pass
+            return jsonify({"error": f"Upload save failed for '{display_name}': {exc}"}), 400
+
         job_id = f"q_{uuid.uuid4().hex[:8]}"
         media_type = "video" if ext in video_exts else ("zip" if ext == ".zip" else "image")
 
         job_entry = {
             "job_id": job_id,
             "unique_stem": unique_stem,
-            "original_name": os.path.basename(f.filename),
+            "original_name": display_name,
             "saved_upload_path": upload_path,
             "ext": ext,
             "media_type": media_type,
@@ -1810,6 +2309,7 @@ def api_qr_enqueue():
         with _qr_jobs_lock:
             _qr_jobs[job_id] = job_entry
             _qr_job_order.append(job_id)
+            _prune_qr_history_locked()
         _qr_upload_queue.put(job_id)
         enqueued_jobs.append({
             "job_id": job_id,
@@ -1903,13 +2403,13 @@ def api_live_detect():
     """
     save_snapshot = request.form.get("save_snapshot", "false").lower() == "true"
     auto_trigger = request.form.get("auto_trigger", "true").lower() == "true"
-    conf_thresh = max(0.50, float(request.form.get("conf", 0.50)))
+    conf_thresh = _safe_float(request.form.get("conf", 0.50), 0.50, min_v=0.50, max_v=0.99)
     use_csi = request.form.get("use_csi", "false").lower() == "true"
 
     if "frame" in request.files:
         file = request.files["frame"]
         file_bytes = np.frombuffer(file.read(), np.uint8)
-        img_bgr = cv2.imdecode(file_bytes, np.uint8 if False else cv2.IMREAD_COLOR)
+        img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         if img_bgr is None:
             return jsonify({"error": "Invalid frame data"}), 400
         # Apply Auto White Balance to eliminate IMX219 purple/pink tint
@@ -1979,6 +2479,9 @@ def api_live_detect():
                 detections = raw_detections
         else:
             detections = raw_detections
+            with _live_temporal_lock:
+                _live_temporal_state["prev_detections"] = raw_detections
+                _live_temporal_state["prev_time"] = time.time()
 
     plan = evaluate_deterrent_plan(detections)
     infer_ms = round((time.perf_counter() - t0) * 1000.0, 1)
@@ -1998,15 +2501,16 @@ def api_live_detect():
         result_path = os.path.join(app.config["RESULTS_FOLDER"], result_filename)
         annotated_bgr = draw_tactical_boxes(img_bgr, detections)
         cv2.imwrite(result_path, annotated_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
+        thumb_filename = _save_image_thumbnail(annotated_bgr, unique_stem)
         file_size_kb = os.path.getsize(result_path) / 1024.0
 
-        # Also trigger deterrent immediately on manual snapshot if threat present and no SAFE
-        if plan["esp32_token"] and not triggered_now:
+        # Respect auto_trigger checkbox even during manual snapshots
+        if auto_trigger and plan["esp32_token"] and not triggered_now:
             triggered_now = sync_deterrents_with_plan(plan)
 
         ev = DeterrentEvent(
             filename=result_filename,
-            thumbnail_filename=None,
+            thumbnail_filename=thumb_filename,
             media_type="live_snapshot",
             primary_target=plan["primary_target"],
             action_taken=plan["action_taken"],
@@ -2041,24 +2545,27 @@ def api_live_detect():
 def api_deterrent_test():
     """
     Tests each of the 3 deterrents individually:
-      - actuator = 'SOUND' (with pattern = 'BIRD' | 'SMALL' | 'LARGE' and randomized duration)
-      - actuator = 'WATER' (sends 'WATER_TEST' to ESP32 + activates dashboard telemetry)
-      - actuator = 'LIGHT' (sends 'LIGHT_TEST' to ESP32 + activates dashboard telemetry)
+      - actuator = 'SOUND' (with pattern = 'BIRD' | 'SMALL' | 'LARGE' and randomized or custom duration)
+      - actuator = 'WATER' (sends 'WATER_TEST' to ESP32 + updates WATER telemetry only)
+      - actuator = 'LIGHT' (sends 'LIGHT_TEST' to ESP32 + updates LIGHT telemetry only)
     """
     data = request.get_json(silent=True) or {}
-    actuator = str(data.get("actuator", "SOUND")).upper()
-    pattern = str(data.get("pattern", "LARGE")).upper()
+    actuator = str(data.get("actuator", "SOUND")).upper().strip()
+    pattern = str(data.get("pattern", "")).upper().strip()
+    raw_dur = data.get("duration_ms")
+    parsed_dur = _safe_int(raw_dur, 0) if raw_dur is not None else 0
+    custom_dur_ms = max(500, min(30000, parsed_dur)) if parsed_dur > 0 else 0
 
     if actuator == "SOUND":
         if "BIRD" in pattern:
-            dur_ms = random.randint(3000, 6000)
             token = "BIRD"
+            dur_ms = custom_dur_ms if custom_dur_ms > 0 else random.randint(3000, 6000)
         elif "SMALL" in pattern:
-            dur_ms = random.randint(5000, 9000)
             token = "SMALL"
+            dur_ms = custom_dur_ms if custom_dur_ms > 0 else random.randint(5000, 9000)
         else:
-            dur_ms = random.randint(8000, 14000)
             token = "LARGE"
+            dur_ms = custom_dur_ms if custom_dur_ms > 0 else random.randint(8000, 14000)
         dispatch_esp32_command(f"SOUND_TEST_{token}", duration_ms=dur_ms, actuators=["SOUND"])
         return jsonify({
             "status": "triggered",
@@ -2069,10 +2576,14 @@ def api_deterrent_test():
         })
 
     elif actuator == "WATER":
-        if "LARGE" in pattern:
+        if custom_dur_ms > 0:
+            dur_ms = custom_dur_ms
+        elif "LARGE" in pattern:
+            dur_ms = random.randint(8000, 14000)
+        elif "SMALL" in pattern:
             dur_ms = random.randint(5000, 9000)
         else:
-            dur_ms = random.randint(2500, 5000)
+            dur_ms = random.randint(2500, 6000)
         dispatch_esp32_command("WATER_TEST", duration_ms=dur_ms, actuators=["WATER"])
         return jsonify({
             "status": "triggered",
@@ -2083,7 +2594,16 @@ def api_deterrent_test():
         })
 
     elif actuator == "LIGHT":
-        dur_ms = int(data.get("duration_ms", 5000))
+        if custom_dur_ms > 0:
+            dur_ms = custom_dur_ms
+        elif "BIRD" in pattern:
+            dur_ms = random.randint(3000, 6000)
+        elif "SMALL" in pattern:
+            dur_ms = random.randint(5000, 9000)
+        elif "LARGE" in pattern:
+            dur_ms = random.randint(8000, 14000)
+        else:
+            dur_ms = random.randint(3500, 7500)
         dispatch_esp32_command("LIGHT_TEST", duration_ms=dur_ms, actuators=["LIGHT"])
         return jsonify({
             "status": "triggered",
@@ -2105,21 +2625,81 @@ def api_deterrent_stop():
     })
 
 
+def _probe_esp32_node(timeout_sec: float = 0.5):
+    host = os.environ.get("ESP32_HOST", "192.168.4.1")
+    try:
+        req = urllib.request.Request(
+            f"http://{host}/status",
+            headers={"Connection": "close"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            now = time.time()
+            with _state_lock:
+                _deterrent_state["esp32_online"] = True
+                _deterrent_state["esp32_ip"] = data.get("ip", host)
+                if data.get("firmware"):
+                    _deterrent_state["esp32_firmware"] = str(data.get("firmware"))
+                # Reconcile live remaining durations when reported by ESP32
+                buz_active = bool(data.get("buzzer_active", False))
+                pmp_active = bool(data.get("pump_active", False))
+                led_active = bool(data.get("led_active", False))
+                rem_all = _safe_int(data.get("remaining_ms", 0), 0, min_v=0)
+                pmp_rem = _safe_int(data.get("pump_remaining_ms", rem_all), 0, min_v=0)
+                led_rem = _safe_int(data.get("led_remaining_ms", rem_all), 0, min_v=0)
+                buz_rem = _safe_int(data.get("buzzer_remaining_ms", rem_all), 0, min_v=0)
+                if buz_active and buz_rem > 0:
+                    _deterrent_state["channel_until"]["SOUND"] = now + (buz_rem / 1000.0)
+                elif not buz_active and _deterrent_state["channel_until"]["SOUND"] <= now + 0.5:
+                    _deterrent_state["channel_until"]["SOUND"] = 0.0
+                if pmp_active and pmp_rem > 0:
+                    _deterrent_state["channel_until"]["WATER"] = now + (pmp_rem / 1000.0)
+                elif not pmp_active and _deterrent_state["channel_until"]["WATER"] <= now + 0.5:
+                    _deterrent_state["channel_until"]["WATER"] = 0.0
+                if led_active and led_rem > 0:
+                    _deterrent_state["channel_until"]["LIGHT"] = now + (led_rem / 1000.0)
+                elif not led_active and _deterrent_state["channel_until"]["LIGHT"] <= now + 0.5:
+                    _deterrent_state["channel_until"]["LIGHT"] = 0.0
+            return True
+    except Exception:
+        with _state_lock:
+            _deterrent_state["esp32_online"] = False
+        return False
+
+
+def _esp32_heartbeat_worker():
+    while True:
+        try:
+            env_host = os.environ.get("ESP32_HOST", "").strip()
+            lan_ips = _get_local_ipv4_addresses()
+            on_ap = any(ip.startswith("192.168.4.") for ip in lan_ips)
+            if env_host or on_ap:
+                _probe_esp32_node(timeout_sec=0.5)
+            else:
+                with _state_lock:
+                    _deterrent_state["esp32_online"] = False
+        except Exception:
+            pass
+        time.sleep(4.0)
+
+
+_heartbeat_thread = threading.Thread(target=_esp32_heartbeat_worker, daemon=True)
+_heartbeat_thread.start()
+
+
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    resp = jsonify({"status": "ok"})
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
+
 @app.route("/api/esp32/status", methods=["GET"])
 def api_esp32_status():
     probe = request.args.get("probe", "false").lower() == "true"
     if probe:
-        host = os.environ.get("ESP32_HOST", "192.168.4.1")
-        try:
-            req = urllib.request.Request(f"http://{host}/status", method="GET")
-            with urllib.request.urlopen(req, timeout=0.6) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                with _state_lock:
-                    _deterrent_state["esp32_online"] = True
-                    _deterrent_state["esp32_ip"] = data.get("ip", host)
-        except Exception:
-            with _state_lock:
-                _deterrent_state["esp32_online"] = False
+        _probe_esp32_node(timeout_sec=0.6)
 
     return jsonify(get_active_deterrent_telemetry())
 
@@ -2133,6 +2713,7 @@ class DashboardGrayWorldAWB:
     def __init__(self, smoothing: float = 0.85):
         self.smoothing = smoothing
         self.running_gain = None
+        self._lock = threading.Lock()
 
     def balance(self, bgr_frame: np.ndarray) -> np.ndarray:
         if bgr_frame is None or bgr_frame.size == 0:
@@ -2145,25 +2726,28 @@ class DashboardGrayWorldAWB:
             return bgr_frame
         target = (mb + mg + mr) / 3.0
         gain = np.array([target / mb, target / mg, target / mr], dtype=np.float32)
-        if self.running_gain is None:
-            self.running_gain = gain
-        else:
-            self.running_gain = (self.smoothing * self.running_gain) + ((1.0 - self.smoothing) * gain)
-        lut_b = np.clip(np.arange(256) * self.running_gain[0], 0, 255).astype(np.uint8)
-        lut_g = np.clip(np.arange(256) * self.running_gain[1], 0, 255).astype(np.uint8)
-        lut_r = np.clip(np.arange(256) * self.running_gain[2], 0, 255).astype(np.uint8)
+        with self._lock:
+            if self.running_gain is None:
+                self.running_gain = gain
+            else:
+                self.running_gain = (self.smoothing * self.running_gain) + ((1.0 - self.smoothing) * gain)
+            g_snapshot = self.running_gain.copy()
+        lut_b = np.clip(np.arange(256) * g_snapshot[0], 0, 255).astype(np.uint8)
+        lut_g = np.clip(np.arange(256) * g_snapshot[1], 0, 255).astype(np.uint8)
+        lut_r = np.clip(np.arange(256) * g_snapshot[2], 0, 255).astype(np.uint8)
         b, g, r = cv2.split(bgr_frame)
         return cv2.merge([cv2.LUT(b, lut_b), cv2.LUT(g, lut_g), cv2.LUT(r, lut_r)])
 
 _global_awb = DashboardGrayWorldAWB()
 
+_camera_state_lock = threading.Lock()
 _camera_state = {
     "mirror_h": True,
     "mirror_v": False,
     "rotation": 180,
     "awb": True,
-    "sensor_id": int(os.environ.get("CSI_SENSOR_ID", "0")),
-    "flip_method": int(os.environ.get("CSI_FLIP_METHOD", "0")),
+    "sensor_id": _safe_int(os.environ.get("CSI_SENSOR_ID", "0"), 0, min_v=0, max_v=1),
+    "flip_method": _safe_int(os.environ.get("CSI_FLIP_METHOD", "0"), 0, min_v=0, max_v=7),
 }
 
 
@@ -2184,6 +2768,7 @@ class JetsonCameraHub:
         self.latest_frame = None
         self.latest_jpeg = None
         self.last_client_time = 0.0
+        self.last_open_failed_ts = 0.0
 
     @classmethod
     def get_instance(cls):
@@ -2202,8 +2787,9 @@ class JetsonCameraHub:
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             return cap
 
-        sid = _camera_state.get("sensor_id", 0)
-        flip = _camera_state.get("flip_method", 0)
+        with _camera_state_lock:
+            sid = _camera_state.get("sensor_id", 0)
+            flip = _camera_state.get("flip_method", 0)
         # Bare hardware GStreamer pipeline (camera_overrides.isp + software AWB handle white balance;
         # never fall back to cv2.VideoCapture(0) V4L2 which corrupts IMX219 Argus subdev state).
         pipe = (
@@ -2228,10 +2814,13 @@ class JetsonCameraHub:
         with self.lock:
             self.last_client_time = time.time()
             if self.running and self.thread and self.thread.is_alive():
-                return
+                return True
+            if (time.monotonic() - self.last_open_failed_ts) < 3.0:
+                return False
             self.running = True
             self.thread = threading.Thread(target=self._worker, daemon=True)
             self.thread.start()
+            return True
 
     def _worker(self):
         print("[CAM-HUB] Starting dedicated single-owner capture thread...")
@@ -2239,7 +2828,9 @@ class JetsonCameraHub:
             self.cap = self._open_camera()
             if not self.cap or not self.cap.isOpened():
                 print("[CAM-HUB] Warning: Unable to open camera pipeline.")
-                self.running = False
+                with self.lock:
+                    self.last_open_failed_ts = time.monotonic()
+                    self.running = False
                 return
 
             print("[CAM-HUB] Camera stream active and locked to hub thread.")
@@ -2267,14 +2858,17 @@ class JetsonCameraHub:
                     self.cap = self._open_camera()
                     if not self.cap or not self.cap.isOpened():
                         print("[CAM-HUB] Camera re-initialization failed; exiting worker for clean retry.")
+                        with self.lock:
+                            self.last_open_failed_ts = time.monotonic()
                         break
                     continue
 
                 # Process rotation, mirror, AWB
-                rot = _camera_state.get("rotation", 0)
-                mh = _camera_state.get("mirror_h", False)
-                mv = _camera_state.get("mirror_v", False)
-                do_awb = _camera_state.get("awb", True)
+                with _camera_state_lock:
+                    rot = _camera_state.get("rotation", 0)
+                    mh = _camera_state.get("mirror_h", False)
+                    mv = _camera_state.get("mirror_v", False)
+                    do_awb = _camera_state.get("awb", True)
 
                 if rot == 90:
                     frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -2301,6 +2895,8 @@ class JetsonCameraHub:
         finally:
             with self.lock:
                 self.running = False
+                self.latest_frame = None
+                self.latest_jpeg = None
                 if self.cap:
                     try:
                         self.cap.release()
@@ -2316,7 +2912,8 @@ class JetsonCameraHub:
             return self.latest_jpeg
 
     def get_frame(self):
-        self.start_if_needed()
+        if not self.start_if_needed():
+            return None
         deadline = time.time() + 4.5
         while time.time() < deadline:
             with self.lock:
@@ -2334,47 +2931,69 @@ class JetsonCameraHub:
 @app.route("/api/camera/control", methods=["GET", "POST"])
 def api_camera_control():
     """Get or update live camera settings (mirror, rotation, AWB)."""
-    global _camera_state
-    if request.method == "POST":
-        data = request.get_json(silent=True) or request.form.to_dict()
-        if "mirror_h" in data:
-            _camera_state["mirror_h"] = str(data["mirror_h"]).lower() in ("true", "1")
-        if "mirror_v" in data:
-            _camera_state["mirror_v"] = str(data["mirror_v"]).lower() in ("true", "1")
-        if "toggle_mirror" in data:
-            _camera_state["mirror_h"] = not _camera_state["mirror_h"]
-        if "rotation" in data:
-            _camera_state["rotation"] = int(data["rotation"]) % 360
-        if "rotate" in data:
-            _camera_state["rotation"] = (_camera_state["rotation"] + 90) % 360
-        if "flip" in data:
-            _camera_state["rotation"] = (_camera_state["rotation"] + 180) % 360
-        if "awb" in data:
-            _camera_state["awb"] = str(data["awb"]).lower() in ("true", "1")
-        if "toggle_awb" in data:
-            _camera_state["awb"] = not _camera_state["awb"]
+    with _camera_state_lock:
+        if request.method == "POST":
+            data = request.get_json(silent=True) or request.form.to_dict()
+            if "mirror_h" in data:
+                _camera_state["mirror_h"] = str(data["mirror_h"]).lower() in ("true", "1")
+            if "mirror_v" in data:
+                _camera_state["mirror_v"] = str(data["mirror_v"]).lower() in ("true", "1")
+            if "toggle_mirror" in data:
+                _camera_state["mirror_h"] = not _camera_state["mirror_h"]
+            if "rotation" in data:
+                _camera_state["rotation"] = (_safe_int(data["rotation"], _camera_state["rotation"]) // 90 * 90) % 360
+            if "rotate" in data:
+                _camera_state["rotation"] = (_camera_state["rotation"] + 90) % 360
+            if "flip" in data:
+                _camera_state["rotation"] = (_camera_state["rotation"] + 180) % 360
+            if "awb" in data:
+                _camera_state["awb"] = str(data["awb"]).lower() in ("true", "1")
+            if "toggle_awb" in data:
+                _camera_state["awb"] = not _camera_state["awb"]
+        snapshot = dict(_camera_state)
 
-    return jsonify({"status": "ok", "settings": _camera_state})
+    return jsonify({"status": "ok", "settings": snapshot})
 
 
 @app.route("/api/camera/stream")
 def api_camera_stream():
     """MJPEG live camera stream from Jetson IMX219 with AWB, orientation, and mirror."""
     hub = JetsonCameraHub.get_instance()
-    hub.start_if_needed()
+    started = hub.start_if_needed()
+    if not started and hub.latest_jpeg is None:
+        return jsonify({"error": "No live camera device available"}), 503
+
+    # Wait briefly for first frame before starting multipart stream so unavailable cameras return clean 503
+    wait_deadline = time.monotonic() + 3.0
+    first_jpeg = hub.get_jpeg()
+    while first_jpeg is None and time.monotonic() < wait_deadline and hub.running:
+        time.sleep(0.05)
+        first_jpeg = hub.get_jpeg()
+    if first_jpeg is None:
+        return jsonify({"error": "Camera hardware unavailable or stream failed to initialize"}), 503
 
     def _stream_gen():
-        last_frame_bytes = None
+        last_frame_bytes = first_jpeg
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(first_jpeg)).encode() + b"\r\n\r\n"
+            + first_jpeg + b"\r\n"
+        )
+        idle_since = time.monotonic()
         while True:
             jpeg_bytes = hub.get_jpeg()
             if jpeg_bytes is not None and jpeg_bytes != last_frame_bytes:
                 last_frame_bytes = jpeg_bytes
+                idle_since = time.monotonic()
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
                     b"Content-Length: " + str(len(jpeg_bytes)).encode() + b"\r\n\r\n"
                     + jpeg_bytes + b"\r\n"
                 )
+            elif not hub.running and (time.monotonic() - idle_since) > 6.0:
+                break
             time.sleep(0.03)
 
     resp = Response(_stream_gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -2442,13 +3061,56 @@ def handle_spa_404(err):
     return serve_spa("")
 
 
+@app.errorhandler(413)
+def handle_entity_too_large(err):
+    return jsonify({"error": "Upload exceeds maximum allowed size (1024 MB)."}), 413
+
+
+@app.errorhandler(500)
+def handle_internal_error(err):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Internal server error while processing request."}), 500
+    return "Internal server error", 500
+
+
+_ip_cache_lock = threading.Lock()
+_ip_cache_ts = 0.0
+_ip_cache_ips: list[str] = []
+
+
+def _is_virtual_or_ignored_ip(ip: str, strict: bool = False) -> bool:
+    if not ip:
+        return True
+    if ip.startswith(("127.", "192.168.55.", "172.17.", "169.254.", "0.")):
+        return True
+    if strict:
+        # Skip common Windows Hyper-V/WSL/VirtualBox/Hotspot adapters in fallback enumeration
+        if ip.startswith(("192.168.56.", "192.168.137.")):
+            return True
+        if ip.startswith("172."):
+            parts = ip.split(".")
+            if len(parts) >= 2:
+                try:
+                    second = int(parts[1])
+                    if 16 <= second <= 31:
+                        return True
+                except Exception:
+                    pass
+    return False
+
+
 def _get_local_ipv4_addresses() -> list[str]:
+    global _ip_cache_ts, _ip_cache_ips
+    now = time.monotonic()
+    with _ip_cache_lock:
+        if _ip_cache_ips and (now - _ip_cache_ts) < 2.5:
+            return list(_ip_cache_ips)
+
     ips: list[str] = []
     ignore_ifaces = ("lo", "docker", "l4tbr", "br-", "veth", "virbr", "tun", "tap")
-    ignore_prefixes = ("127.", "192.168.55.", "172.17.", "169.254.")
 
-    def _add_ip(ip: str, front: bool = False):
-        if not ip or any(ip.startswith(p) for p in ignore_prefixes):
+    def _add_ip(ip: str, front: bool = False, strict_virtual: bool = False):
+        if _is_virtual_or_ignored_ip(ip, strict=strict_virtual):
             return
         if ip in ips:
             if front:
@@ -2460,39 +3122,40 @@ def _get_local_ipv4_addresses() -> list[str]:
         else:
             ips.append(ip)
 
-    try:
-        import subprocess
-        out = subprocess.check_output(
-            ["ip", "-4", "-o", "addr", "show", "up", "scope", "global"],
-            text=True,
-            timeout=1.0,
-        )
-        wifi_ips: list[str] = []
-        other_ips: list[str] = []
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            iface = parts[1]
-            if any(iface.startswith(p) for p in ignore_ifaces):
-                continue
-            ip = parts[3].split("/")[0]
-            if any(ip.startswith(p) for p in ignore_prefixes):
-                continue
-            if ip.startswith("192.168.4."):
-                _add_ip(ip, front=True)
-            elif iface.startswith(("wl", "wlan", "wifi")):
-                wifi_ips.append(ip)
-            else:
-                other_ips.append(ip)
-        for ip in wifi_ips + other_ips:
-            _add_ip(ip, front=False)
-    except Exception:
-        pass
+    if os.name != "nt":
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["ip", "-4", "-o", "addr", "show", "up", "scope", "global"],
+                text=True,
+                timeout=1.0,
+            )
+            wifi_ips: list[str] = []
+            other_ips: list[str] = []
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                iface = parts[1]
+                if any(iface.startswith(p) for p in ignore_ifaces):
+                    continue
+                ip = parts[3].split("/")[0]
+                if _is_virtual_or_ignored_ip(ip):
+                    continue
+                if ip.startswith("192.168.4."):
+                    _add_ip(ip, front=True)
+                elif iface.startswith(("wl", "wlan", "wifi")):
+                    wifi_ips.append(ip)
+                else:
+                    other_ips.append(ip)
+            for ip in wifi_ips + other_ips:
+                _add_ip(ip, front=False)
+        except Exception:
+            pass
 
+    import socket
     for probe_target in (("192.168.4.1", 80), ("8.8.8.8", 80)):
         try:
-            import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(probe_target)
             routed_ip = s.getsockname()[0]
@@ -2502,23 +3165,24 @@ def _get_local_ipv4_addresses() -> list[str]:
         except Exception:
             pass
 
-    if not ips:
-        try:
-            import socket
-            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-                _add_ip(info[4][0], front=False)
-        except Exception:
-            pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addr = info[4][0]
+            _add_ip(addr, front=addr.startswith("192.168.4."), strict_virtual=True)
+    except Exception:
+        pass
 
-    return ips
+    with _ip_cache_lock:
+        _ip_cache_ts = time.monotonic()
+        _ip_cache_ips = list(ips)
+    return list(ips)
 
 
 def _esp32_subnet_arp_warmer():
     """
     When connected to the ESP32 SoftAP (192.168.4.0/24), proactively probes
-    192.168.4.2..192.168.4.10 every 1.5s so mobile phones connected to the
-    ESP32 AP immediately cache the Jetson's MAC address in their ARP table
-    without relying on 802.11 broadcast ARP frames across DTIM sleep.
+    192.168.4.1..192.168.4.6 every 5.0s so mobile phones connected to the
+    ESP32 AP immediately cache the host MAC address without saturating the AP.
     """
     import socket
     while True:
@@ -2540,7 +3204,7 @@ def _esp32_subnet_arp_warmer():
                 s.close()
         except Exception:
             pass
-        time.sleep(1.5)
+        time.sleep(5.0)
 
 
 _arp_warmer_thread = threading.Thread(target=_esp32_subnet_arp_warmer, daemon=True)

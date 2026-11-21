@@ -18,6 +18,7 @@ uint32_t getRandomizedClassDurationMs(const String& target);
 uint32_t triggerDeterrent(const String& target, uint32_t durationMs = 0);
 void stopBuzzer();
 bool isBuzzerActive();
+bool isBuzzerTargetAllowed(const String& target);
 String getLastTarget();
 uint32_t getCurrentDurationMs();
 uint32_t getRemainingDurationMs();

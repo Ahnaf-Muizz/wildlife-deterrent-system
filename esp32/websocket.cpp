@@ -1,6 +1,7 @@
 #include "websocket.h"
 #include "buzzer.h"
 #include "pump.h"
+#include "led.h"
 #include <WebSocketsServer.h>
 
 static WebSocketsServer webSocket = WebSocketsServer(81);
@@ -43,18 +44,30 @@ static void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size
       IPAddress ip = webSocket.remoteIP(num);
       Serial.printf("[WS] Client [%u] Connected from %s\n", num, ip.toString().c_str());
       
-      String welcome = "{\"event\":\"connected\",\"system\":\"Sentinel-ESP32\",\"last_target\":\"" + 
-                        getLastTarget() + "\",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") +
+      uint32_t buzDur = getCurrentDurationMs();
+      uint32_t pmpDur = getCurrentPumpDurationMs();
+      uint32_t ledDur = getCurrentLedDurationMs();
+      uint32_t maxDur = max(buzDur, max(pmpDur, ledDur));
+      uint32_t maxRem = max(getRemainingDurationMs(), max(getRemainingPumpDurationMs(), getRemainingLedDurationMs()));
+
+      String welcome = "{\"event\":\"connected\",\"firmware\":\"v2.5-stable\",\"system\":\"Sentinel-ESP32\",\"last_target\":\"" +
+                        jsonEscape(getLastTarget()) + "\",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") +
                         ",\"pump_active\":" + (isPumpActive() ? "true" : "false") +
-                        ",\"duration_ms\":" + String(getCurrentDurationMs()) +
-                        ",\"remaining_ms\":" + String(getRemainingDurationMs()) +
-                        ",\"pump_duration_ms\":" + String(getCurrentPumpDurationMs()) + "}";
+                        ",\"led_active\":" + (isLedActive() ? "true" : "false") +
+                        ",\"duration_ms\":" + String(maxDur) +
+                        ",\"remaining_ms\":" + String(maxRem) +
+                        ",\"pump_duration_ms\":" + String(pmpDur) +
+                        ",\"led_duration_ms\":" + String(ledDur) + "}";
       webSocket.sendTXT(num, welcome);
       break;
     }
 
     case WStype_TEXT: {
-      String msg = String((char*)payload);
+      String msg;
+      msg.reserve(length + 1);
+      if (payload != NULL && length > 0) {
+        msg.concat((const char*)payload, (unsigned int)length);
+      }
       Serial.printf("[WS] Received from [%u]: %s\n", num, msg.c_str());
 
       String target = "";
@@ -66,43 +79,19 @@ static void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size
         if (target.length() == 0) target = extractJsonValue(msg, "action");
 
         String durStr = extractJsonValue(msg, "duration");
-        if (durStr.length() > 0) {
-          uint32_t d = durStr.toInt();
-          if (d > 0) requestedDurationMs = (d > 60) ? d : (d * 1000);
-        }
+        uint32_t parsed = parseSafeDurationMs(durStr);
+        if (parsed > 0) requestedDurationMs = parsed;
       } else {
         target = msg;
       }
 
       target.trim();
-
-      if (target.equalsIgnoreCase("STOP") || target.equalsIgnoreCase("OFF") || target.equalsIgnoreCase("SAFE")) {
-        stopBuzzer();
-        stopPump();
-        broadcastWebSocket("{\"event\":\"stopped\",\"buzzer_active\":false,\"pump_active\":false,\"duration_ms\":0,\"remaining_ms\":0,\"pump_duration_ms\":0}");
-      } else if (target.equalsIgnoreCase("WATER_TEST") || target.equalsIgnoreCase("PUMP_TEST") || target.equalsIgnoreCase("WATER")) {
-        uint32_t pumpDur = triggerPump("WATER_TEST", requestedDurationMs);
-        String ack = "{\"event\":\"actuator_test\",\"target\":\"WATER_TEST\",\"duration_ms\":" + String(pumpDur) +
-                     ",\"pump_duration_ms\":" + String(pumpDur) +
-                     ",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") +
-                     ",\"pump_active\":true}";
-        broadcastWebSocket(ack);
-      } else if (target.equalsIgnoreCase("LIGHT_TEST")) {
-        uint32_t simDur = (requestedDurationMs > 0) ? requestedDurationMs : 4500;
-        String ack = "{\"event\":\"actuator_test\",\"target\":\"LIGHT_TEST\",\"duration_ms\":" + String(simDur) +
-                     ",\"buzzer_active\":" + (isBuzzerActive() ? "true" : "false") +
-                     ",\"pump_active\":" + (isPumpActive() ? "true" : "false") + "}";
-        broadcastWebSocket(ack);
-      } else if (target.length() > 0) {
-        uint32_t actualDurationMs = triggerDeterrent(target, requestedDurationMs);
-        uint32_t pumpDurMs = triggerPump(target, 0);
-        bool pumpOn = (pumpDurMs > 0) || isPumpActive();
-        String ack = "{\"event\":\"triggered\",\"target\":\"" + target +
-                     "\",\"duration_ms\":" + String(actualDurationMs) +
-                     ",\"remaining_ms\":" + String(actualDurationMs) +
-                     ",\"pump_duration_ms\":" + String(pumpDurMs) +
-                     ",\"buzzer_active\":true,\"pump_active\":" + (pumpOn ? "true" : "false") + "}";
-        broadcastWebSocket(ack);
+      if (target.length() > 0) {
+        int code = 200;
+        String ack = executeUnifiedCommand(target, requestedDurationMs, "WS", &code);
+        if (code != 200) {
+          webSocket.sendTXT(num, ack);
+        }
       }
       break;
     }

@@ -152,8 +152,25 @@ export const EventLogGallery: React.FC<EventLogGalleryProps> = ({
           {events.map((ev) => (
             <article
               key={ev.id}
+              tabIndex={0}
               onClick={() => onSelectEvent(ev)}
-              className="group relative flex flex-col overflow-hidden rounded-xl border border-slate-800/90 bg-[#0d1320] transition hover:-translate-y-0.5 hover:border-sky-500/50 hover:shadow-[0_8px_30px_rgba(0,0,0,0.45)] cursor-pointer"
+              onKeyDown={(e) => {
+                if ((e.target as HTMLElement).closest('button')) return;
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  onSelectEvent(ev);
+                } else if (e.key === ' ') {
+                  e.preventDefault();
+                }
+              }}
+              onKeyUp={(e) => {
+                if ((e.target as HTMLElement).closest('button')) return;
+                if (e.key === ' ') {
+                  e.preventDefault();
+                  onSelectEvent(ev);
+                }
+              }}
+              className="group relative flex flex-col overflow-hidden rounded-xl border border-slate-800/90 bg-[#0d1320] transition hover:-translate-y-0.5 hover:border-sky-500/50 hover:shadow-[0_8px_30px_rgba(0,0,0,0.45)] cursor-pointer focus-visible:outline-2 focus-visible:outline-sky-400"
             >
               {/* Media Thumbnail Preview */}
               <div className="relative h-52 w-full overflow-hidden border-b border-slate-800/80 bg-black">

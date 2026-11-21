@@ -15,6 +15,7 @@ const int PUMP_PIN = 18;
 void setupPump();
 void silencePump();
 uint32_t getRandomizedPumpDurationMs(const String& target);
+bool isPumpTargetAllowed(const String& target);
 uint32_t triggerPump(const String& target, uint32_t durationMs = 0);
 void stopPump();
 

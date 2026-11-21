@@ -11,12 +11,12 @@ import {
   Film,
   Target,
 } from 'lucide-react';
-import { DeterrentEventRecord, DeterrentTelemetry } from '../types/sentinel';
+import { DeterrentEventRecord, DeterrentTelemetry, ThreatCategory } from '../types/sentinel';
 import { notificationService } from '../services/notificationService';
 
 interface EventDetailModalProps {
   event: DeterrentEventRecord | null;
-  telemetry?: DeterrentTelemetry;
+  autoSyncHardware?: boolean;
   onTelemetryUpdate?: (t: DeterrentTelemetry) => void;
   onClose: () => void;
   onDelete: (id: number) => Promise<void>;
@@ -24,7 +24,7 @@ interface EventDetailModalProps {
 
 export const EventDetailModal: React.FC<EventDetailModalProps> = ({
   event,
-  telemetry,
+  autoSyncHardware = false,
   onTelemetryUpdate,
   onClose,
   onDelete,
@@ -32,7 +32,12 @@ export const EventDetailModal: React.FC<EventDetailModalProps> = ({
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const videoPlayerRef = useRef<HTMLVideoElement | null>(null);
   const lastSyncRef = useRef<{ target: string; time: number }>({ target: 'NONE', time: 0 });
-  const [liveVideoTarget, setLiveVideoTarget] = useState<string>('None');
+  const [hardwareSyncEnabled, setHardwareSyncEnabled] = useState<boolean>(autoSyncHardware);
+
+  useEffect(() => {
+    setHardwareSyncEnabled(Boolean(autoSyncHardware));
+    lastSyncRef.current = { target: 'NONE', time: 0 };
+  }, [event?.id, autoSyncHardware]);
 
   // Open/close native <dialog> via showModal() and register light-dismiss fallback per modern-web-guidance
   useEffect(() => {
@@ -46,20 +51,31 @@ export const EventDetailModal: React.FC<EventDetailModalProps> = ({
     }
 
     if (!('closedBy' in HTMLDialogElement.prototype)) {
-      const handleBackdropClick = (e: MouseEvent) => {
-        if (e.target !== dialog) return;
+      const isOutside = (e: PointerEvent) => {
         const rect = dialog.getBoundingClientRect();
-        const isInsideContent =
-          rect.top <= e.clientY &&
-          e.clientY <= rect.top + rect.height &&
-          rect.left <= e.clientX &&
-          e.clientX <= rect.left + rect.width;
-        if (!isInsideContent) {
+        return (
+          e.clientX < rect.left ||
+          e.clientX > rect.right ||
+          e.clientY < rect.top ||
+          e.clientY > rect.bottom
+        );
+      };
+      let pressedOutside = false;
+      const onPointerDown = (e: PointerEvent) => {
+        pressedOutside = isOutside(e);
+      };
+      const onPointerUp = (e: PointerEvent) => {
+        if (pressedOutside && isOutside(e)) {
           dialog.close();
         }
+        pressedOutside = false;
       };
-      dialog.addEventListener('click', handleBackdropClick);
-      return () => dialog.removeEventListener('click', handleBackdropClick);
+      dialog.addEventListener('pointerdown', onPointerDown);
+      dialog.addEventListener('pointerup', onPointerUp);
+      return () => {
+        dialog.removeEventListener('pointerdown', onPointerDown);
+        dialog.removeEventListener('pointerup', onPointerUp);
+      };
     }
   }, [event]);
 
@@ -126,34 +142,33 @@ export const EventDetailModal: React.FC<EventDetailModalProps> = ({
                       videoPlayerRef.current?.play().catch(() => {});
                     }}
                     onTimeUpdate={() => {
+                      if (!hardwareSyncEnabled) return;
                       const vid = videoPlayerRef.current;
-                      if (!vid) return;
+                      if (!vid || vid.paused || vid.ended) return;
                       const cur = vid.currentTime;
-                      let activeTarget = 'None';
+                      let activeTarget: ThreatCategory = 'None';
                       let activeConf = event.confidence || 0.85;
                       if (event.timeline && event.timeline.length > 0) {
+                        let bestDelta = Infinity;
                         for (let i = 0; i < event.timeline.length; i++) {
-                          if (event.timeline[i].time_sec <= cur + 0.25) {
+                          const delta = Math.abs(event.timeline[i].time_sec - cur);
+                          if (delta <= 0.45 && delta < bestDelta) {
+                            bestDelta = delta;
                             activeTarget = event.timeline[i].target;
                             activeConf = event.timeline[i].confidence || activeConf;
-                          } else {
-                            break;
                           }
-                        }
-                        if (activeTarget === 'None' && cur < 0.6 && event.timeline[0].time_sec <= 0.8) {
-                          activeTarget = event.timeline[0].target;
-                          activeConf = event.timeline[0].confidence || activeConf;
                         }
                       } else if (event.primary_target && event.primary_target !== 'None') {
                         activeTarget = event.primary_target;
                       }
-                      setLiveVideoTarget(activeTarget);
                       const nowMs = Date.now();
+                      const isThreatOrSafe =
+                        activeTarget === 'SAFE' ||
+                        activeTarget === 'LARGE MAMMAL' ||
+                        activeTarget === 'SMALL MAMMAL' ||
+                        activeTarget === 'BIRD';
                       if (
-                        (activeTarget === 'SAFE' ||
-                          activeTarget === 'LARGE MAMMAL' ||
-                          activeTarget === 'SMALL MAMMAL' ||
-                          activeTarget === 'BIRD') &&
+                        isThreatOrSafe &&
                         (lastSyncRef.current.target !== activeTarget || nowMs - lastSyncRef.current.time > 900)
                       ) {
                         lastSyncRef.current = { target: activeTarget, time: nowMs };
@@ -162,12 +177,13 @@ export const EventDetailModal: React.FC<EventDetailModalProps> = ({
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify({ target: activeTarget }),
                         })
-                          .then((r) => r.json())
+                          .then((r) => (r.ok ? r.json() : null))
                           .then((res) => {
-                            if (res?.telemetry && onTelemetryUpdate) {
+                            if (!res) return;
+                            if (res.telemetry && onTelemetryUpdate) {
                               onTelemetryUpdate(res.telemetry);
                             }
-                            if (res?.status === 'triggered' && activeTarget !== 'SAFE') {
+                            if (res.status === 'triggered' && activeTarget !== 'SAFE') {
                               notificationService.notifyDetection(
                                 activeTarget,
                                 activeConf,
@@ -178,6 +194,8 @@ export const EventDetailModal: React.FC<EventDetailModalProps> = ({
                             }
                           })
                           .catch(() => {});
+                      } else if (!isThreatOrSafe && lastSyncRef.current.target !== 'None') {
+                        lastSyncRef.current = { target: 'None', time: nowMs };
                       }
                     }}
                     className="max-h-[62vh] w-full rounded-lg object-contain"
@@ -191,7 +209,27 @@ export const EventDetailModal: React.FC<EventDetailModalProps> = ({
                 )}
               </div>
 
-              {/* Interactive Video Threat Timeline Markers */}
+              {/* Hardware Sync Control & Interactive Video Threat Timeline Markers */}
+              {event.media_type === 'video' && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-800 bg-[#080c14] px-4 py-2.5">
+                  <span className="font-mono-tabular text-[11px] text-slate-400">
+                    Replay ESP32 Hardware Sync
+                  </span>
+                  <button
+                    type="button"
+                    aria-pressed={hardwareSyncEnabled}
+                    onClick={() => setHardwareSyncEnabled((prev) => !prev)}
+                    className={`rounded-md border px-3 py-1 font-mono-tabular text-[11px] font-bold transition cursor-pointer ${
+                      hardwareSyncEnabled
+                        ? 'border-emerald-500/50 bg-emerald-500/20 text-emerald-300'
+                        : 'border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    LIVE HARDWARE SYNC: {hardwareSyncEnabled ? 'ON' : 'OFF'}
+                  </button>
+                </div>
+              )}
+
               {event.media_type === 'video' && event.timeline.length > 0 && (
                 <div className="rounded-xl border border-slate-800 bg-[#080c14] p-4">
                   <div className="mb-2.5 flex items-center justify-between">

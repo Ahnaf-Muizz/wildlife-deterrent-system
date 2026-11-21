@@ -2,9 +2,6 @@ import React, { useEffect, useId, useRef, useState } from 'react';
 import {
   QrCode,
   X,
-  Copy,
-  Check,
-  ExternalLink,
   Upload,
   Loader2,
   CheckCircle2,
@@ -13,6 +10,8 @@ import {
   Trash2,
   Smartphone,
   Wifi,
+  ArrowRight,
+  Lock,
 } from 'lucide-react';
 import { DeterrentEventRecord, QrQueueSnapshot } from '../types/sentinel';
 
@@ -25,6 +24,8 @@ interface QrUploadModalProps {
   onSelectEvent: (ev: DeterrentEventRecord) => void;
 }
 
+type QrStepMode = 'both' | 'step1' | 'step2';
+
 export const QrUploadModal: React.FC<QrUploadModalProps> = ({
   isOpen,
   onClose,
@@ -34,28 +35,12 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
   onSelectEvent,
 }) => {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
-  const lastPrimaryIpRef = useRef<string>('');
   const titleId = useId();
   const multiInputId = useId();
-  const hostInputId = useId();
 
-  const [selectedIp, setSelectedIp] = useState<string>('');
-  const [copied, setCopied] = useState(false);
+  const [qrStepMode, setQrStepMode] = useState<QrStepMode>('both');
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const primaryIp = queueSnapshot.network.ips[0] || '';
-    if (!primaryIp) return;
-    if (
-      !selectedIp ||
-      primaryIp !== lastPrimaryIpRef.current ||
-      !queueSnapshot.network.ips.includes(selectedIp)
-    ) {
-      setSelectedIp(primaryIp);
-      lastPrimaryIpRef.current = primaryIp;
-    }
-  }, [queueSnapshot.network.ips, selectedIp]);
 
   // Open/close native <dialog> via showModal() / close() per modern-web-guidance
   useEffect(() => {
@@ -83,19 +68,31 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
 
     let cleanupFallback: (() => void) | undefined;
     if (!('closedBy' in HTMLDialogElement.prototype)) {
-      const handleBackdropClick = (event: MouseEvent) => {
-        if (event.target !== dialog) return;
+      const isOutside = (e: PointerEvent) => {
         const rect = dialog.getBoundingClientRect();
-        const isDialogContent =
-          rect.top <= event.clientY &&
-          event.clientY <= rect.top + rect.height &&
-          rect.left <= event.clientX &&
-          event.clientX <= rect.left + rect.width;
-        if (isDialogContent) return;
-        dialog.close();
+        return (
+          e.clientX < rect.left ||
+          e.clientX > rect.right ||
+          e.clientY < rect.top ||
+          e.clientY > rect.bottom
+        );
       };
-      dialog.addEventListener('click', handleBackdropClick);
-      cleanupFallback = () => dialog.removeEventListener('click', handleBackdropClick);
+      let pressedOutside = false;
+      const handlePointerDown = (event: PointerEvent) => {
+        pressedOutside = isOutside(event);
+      };
+      const handlePointerUp = (event: PointerEvent) => {
+        if (pressedOutside && isOutside(event)) {
+          dialog.close();
+        }
+        pressedOutside = false;
+      };
+      dialog.addEventListener('pointerdown', handlePointerDown);
+      dialog.addEventListener('pointerup', handlePointerUp);
+      cleanupFallback = () => {
+        dialog.removeEventListener('pointerdown', handlePointerDown);
+        dialog.removeEventListener('pointerup', handlePointerUp);
+      };
     }
 
     return () => {
@@ -104,19 +101,15 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
     };
   }, [onClose]);
 
-  const activeIp = selectedIp || queueSnapshot.network.ips[0] || '192.168.4.2';
+  const activeIp = queueSnapshot.network.ips[0] || '192.168.4.2';
   const targetUrl = `http://${activeIp}:${queueSnapshot.network.port || 5002}/qr-upload`;
-  const qrSvgUrl = `/api/qr/svg?url=${encodeURIComponent(targetUrl)}`;
+  const wifiSsid = queueSnapshot.network.wifi_ssid || 'Wildlife-Deterrent-System-AP';
+  const wifiPassword = queueSnapshot.network.wifi_password || 'haustein26';
 
-  const handleCopyUrl = async () => {
-    try {
-      await navigator.clipboard.writeText(targetUrl);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setCopied(false);
-    }
-  };
+  const wifiQrSvgUrl = `/api/qr/svg?type=wifi&ssid=${encodeURIComponent(
+    wifiSsid
+  )}&password=${encodeURIComponent(wifiPassword)}`;
+  const portalQrSvgUrl = `/api/qr/svg?url=${encodeURIComponent(targetUrl)}`;
 
   const handleFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -133,12 +126,15 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
     }
   };
 
+  const singleSizePx = 320;
+  const bothSizePx = 232;
+
   return (
     <dialog
       ref={dialogRef}
       aria-labelledby={titleId}
       {...({ closedby: 'any' } as Record<string, string>)}
-      className="m-auto w-full max-w-4xl rounded-2xl border border-slate-700/90 bg-[#0b101b] p-0 text-slate-100 shadow-2xl"
+      className="m-auto w-[96vw] max-w-6xl rounded-2xl border border-slate-700/90 bg-[#0b101b] p-0 text-slate-100 shadow-2xl"
     >
       {/* Modal Header */}
       <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
@@ -147,11 +143,14 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
             <QrCode className="h-5 w-5" />
           </div>
           <div>
-            <h2 id={titleId} className="font-mono-tabular text-sm font-bold uppercase tracking-wider text-white">
-              QR Mobile Upload & Automatic Scan Queue
+            <h2
+              id={titleId}
+              className="font-mono-tabular text-sm font-bold uppercase tracking-wider text-white"
+            >
+              2-Step QR Onboarding: Join ESP32 Wi-Fi &rarr; Open Upload Portal
             </h2>
             <p className="font-mono-tabular text-[11px] text-slate-400">
-              Scan with any phone camera to upload pictures or videos directly into the AI scan queue
+              First scan joins the ESP32 local Wi-Fi network, second scan opens the automatic AI upload portal
             </p>
           </div>
         </div>
@@ -167,103 +166,128 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
         </button>
       </div>
 
-      {/* Modal Body: Left QR Code Column + Right Live Queue Column */}
-      <div className="grid grid-cols-1 gap-6 p-6 md:grid-cols-12">
-        {/* Left: Scannable QR Code & Network Link (5 cols) */}
-        <div className="flex flex-col items-center justify-between rounded-xl border border-slate-800 bg-[#070a12] p-5 md:col-span-5">
-          <div className="flex w-full items-center justify-between">
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-0.5 font-mono-tabular text-[10px] font-bold text-emerald-300">
-              <Smartphone className="h-3 w-3" />
-              PHONE CAMERA READY
-            </span>
-            <span className="font-mono-tabular text-[10px] text-slate-400">
-              100% OFFLINE QR
-            </span>
-          </div>
-
-          {/* Crisp SVG QR Code Frame */}
-          <div className="my-4 flex items-center justify-center rounded-xl border-4 border-white bg-white p-2 shadow-[0_0_30px_rgba(56,189,248,0.18)]">
-            <img
-              src={qrSvgUrl}
-              alt={`QR Code for ${targetUrl}`}
-              width={230}
-              height={230}
-              className="h-[230px] w-[230px] select-none"
-            />
-          </div>
-
-          {/* Network Host Selector */}
-          <div className="w-full space-y-2.5">
-            {queueSnapshot.network.ips.length > 1 && (
-              <div className="flex flex-wrap gap-1.5">
-                {queueSnapshot.network.ips.map((ip) => (
-                  <button
-                    key={ip}
-                    type="button"
-                    onClick={() => setSelectedIp(ip)}
-                    className={`inline-flex items-center gap-1 rounded px-2 py-1 font-mono-tabular text-[10px] font-bold transition cursor-pointer ${
-                      activeIp === ip
-                        ? 'border border-sky-400 bg-sky-500/20 text-sky-300'
-                        : 'border border-slate-800 bg-slate-900 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    <Wifi className="h-2.5 w-2.5" />
-                    {ip}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            <div>
-              <label
-                htmlFor={hostInputId}
-                className="mb-1 block font-mono-tabular text-[10px] font-semibold uppercase tracking-wider text-slate-400"
-              >
-                Host IP / Mobile Upload URL
-              </label>
-              <div className="flex items-center gap-1.5">
-                <input
-                  id={hostInputId}
-                  name="host_ip"
-                  type="text"
-                  value={activeIp}
-                  onChange={(e) => setSelectedIp(e.target.value.trim())}
-                  autoCorrect="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                  className="w-28 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono-tabular text-xs text-sky-300 focus:border-sky-400 focus:outline-none"
-                />
-                <div className="flex-1 truncate rounded-lg border border-slate-800 bg-slate-950 px-2.5 py-1.5 font-mono-tabular text-[11px] text-slate-300">
-                  {targetUrl}
-                </div>
+      {/* Modal Body: Left 2-Step QR Onboarding (7 cols) + Right Live Queue Column (5 cols) */}
+      <div className="grid grid-cols-1 gap-5 p-6 md:grid-cols-12">
+        {/* Left: Guided 2-Step QR Codes (7 cols) */}
+        <div className="flex flex-col rounded-xl border border-slate-800 bg-[#070a12] p-4 md:col-span-7">
+          <div className="flex h-full flex-col">
+            {/* Top Step View Tabs */}
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="grid w-full grid-cols-3 gap-1 rounded-lg border border-slate-800 bg-[#0b101b] p-1">
+                <button
+                  type="button"
+                  onClick={() => setQrStepMode('both')}
+                  className={`rounded-md px-2 py-1 font-mono-tabular text-[10px] font-bold transition cursor-pointer ${
+                    qrStepMode === 'both'
+                      ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  BOTH STEPS
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setQrStepMode('step1')}
+                  className={`rounded-md px-2 py-1 font-mono-tabular text-[10px] font-bold transition cursor-pointer ${
+                    qrStepMode === 'step1'
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  STEP 1: JOIN WI-FI
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setQrStepMode('step2')}
+                  className={`rounded-md px-2 py-1 font-mono-tabular text-[10px] font-bold transition cursor-pointer ${
+                    qrStepMode === 'step2'
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  STEP 2: OPEN PORTAL
+                </button>
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-2 pt-1">
-              <button
-                type="button"
-                onClick={handleCopyUrl}
-                className="flex items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 py-2 font-mono-tabular text-xs font-bold text-slate-200 transition hover:border-sky-400/50 hover:text-sky-300 cursor-pointer"
+            {/* Warn operator if host PC is not connected to the ESP32 AP (without exposing IP or credentials) */}
+            {queueSnapshot.network.on_esp32_ap === false && (
+              <div
+                role="status"
+                className="mb-3 flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 font-mono-tabular text-[11px] text-amber-200"
               >
-                {copied ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
-                {copied ? 'COPIED' : 'COPY LINK'}
-              </button>
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+                <span>
+                  Host PC is not on the ESP32 Wi-Fi network — connect this host to ESP32 Wi-Fi before scanning Step 2 on a phone.
+                </span>
+              </div>
+            )}
 
-              <a
-                href="/qr-upload"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center justify-center gap-1.5 rounded-lg border border-sky-500/40 bg-sky-500/15 py-2 font-mono-tabular text-xs font-bold text-sky-300 transition hover:bg-sky-500/25"
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-                OPEN UPLOADER
-              </a>
+            {/* Dual / Focused QR Cards */}
+            <div
+              className={`my-auto grid w-full gap-3 ${
+                qrStepMode === 'both' ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'
+              }`}
+            >
+              {/* STEP 1 QR: Join ESP32 SoftAP Wi-Fi */}
+              {(qrStepMode === 'both' || qrStepMode === 'step1') && (
+                <div className="flex flex-col items-center rounded-xl border border-emerald-500/35 bg-[#0b1220] p-3 text-center">
+                  <div className="mb-1.5 flex w-full items-center justify-between">
+                    <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 font-mono-tabular text-[10px] font-bold text-emerald-300">
+                      <Wifi className="h-3 w-3" />
+                      STEP 1 • JOIN WI-FI
+                    </span>
+                    <Lock className="h-3 w-3 text-emerald-400" />
+                  </div>
+
+                  <p className="mb-2 font-mono-tabular text-[10px] text-slate-300">
+                    1. Scan with phone camera to join the ESP32 Wi-Fi network
+                  </p>
+
+                  <div className="flex items-center justify-center rounded-xl border-4 border-white bg-white p-2.5 shadow-[0_0_24px_rgba(16,185,129,0.2)]">
+                    <img
+                      src={wifiQrSvgUrl}
+                      alt={`Step 1 Wi-Fi QR for ${wifiSsid}`}
+                      width={qrStepMode === 'step1' ? singleSizePx : bothSizePx}
+                      height={qrStepMode === 'step1' ? singleSizePx : bothSizePx}
+                      className="block h-auto max-w-full select-none"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* STEP 2 QR: Open Upload Portal */}
+              {(qrStepMode === 'both' || qrStepMode === 'step2') && (
+                <div className="flex flex-col items-center rounded-xl border border-sky-500/35 bg-[#0b1220] p-3 text-center">
+                  <div className="mb-1.5 flex w-full items-center justify-between">
+                    <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/40 bg-sky-500/15 px-2 py-0.5 font-mono-tabular text-[10px] font-bold text-sky-300">
+                      <Smartphone className="h-3 w-3" />
+                      STEP 2 • UPLOAD PORTAL
+                    </span>
+                    <ArrowRight className="h-3 w-3 text-sky-400" />
+                  </div>
+
+                  <p className="mb-2 font-mono-tabular text-[10px] text-slate-300">
+                    2. Once connected to Wi-Fi, scan to open the upload portal
+                  </p>
+
+                  <div className="flex items-center justify-center rounded-xl border-4 border-white bg-white p-2.5 shadow-[0_0_24px_rgba(56,189,248,0.2)]">
+                    <img
+                      src={portalQrSvgUrl}
+                      alt={`Step 2 Upload Portal QR for ${targetUrl}`}
+                      width={qrStepMode === 'step2' ? singleSizePx : bothSizePx}
+                      height={qrStepMode === 'step2' ? singleSizePx : bothSizePx}
+                      className="block h-auto max-w-full select-none"
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
 
-        {/* Right: Multi-File Queue Uploader & Live Queue Monitor (7 cols) */}
-        <div className="flex flex-col justify-between rounded-xl border border-slate-800 bg-[#070a12] p-5 md:col-span-7">
+        {/* Right: Multi-File Queue Uploader & Live Queue Monitor (5 cols) */}
+        <div className="flex flex-col justify-between rounded-xl border border-slate-800 bg-[#070a12] p-5 md:col-span-5">
           <div>
             {/* Queue Summary Counters */}
             <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
@@ -315,7 +339,7 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
                 name="files"
                 type="file"
                 multiple
-                accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/x-msvideo,video/webm,video/x-matroska,application/zip,.jpg,.jpeg,.png,.webp,.mp4,.mov,.avi,.webm,.mkv,.zip"
+                accept="image/jpeg,image/png,image/webp,image/bmp,image/gif,video/mp4,video/quicktime,video/x-msvideo,video/webm,video/x-matroska,video/x-m4v,video/3gpp,application/zip,.jpg,.jpeg,.png,.webp,.bmp,.jfif,.mp4,.mov,.avi,.webm,.mkv,.m4v,.3gp,.zip"
                 onChange={handleFilesSelected}
                 className="visually-hidden"
               />
@@ -347,11 +371,7 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
             )}
 
             {/* Queue Items List */}
-            <div
-              role="status"
-              aria-live="polite"
-              className="max-h-[270px] space-y-2 overflow-y-auto pr-1"
-            >
+            <div className="max-h-[290px] space-y-2 overflow-y-auto pr-1">
               {queueSnapshot.jobs.length === 0 ? (
                 <div className="flex flex-col items-center justify-center rounded-xl border border-slate-800/80 bg-[#0b101b] py-10 text-center">
                   <QrCode className="mb-2 h-7 w-7 text-slate-500" />
@@ -365,25 +385,8 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
               ) : (
                 queueSnapshot.jobs.map((job) => {
                   const ev = job.event;
-                  return (
-                    <div
-                      key={job.job_id}
-                      onClick={() => {
-                        if (ev) {
-                          onSelectEvent(ev);
-                          onClose();
-                        }
-                      }}
-                      className={`flex items-center justify-between gap-3 rounded-lg border p-2.5 transition ${
-                        job.status === 'processing'
-                          ? 'border-sky-500/50 bg-sky-500/10'
-                          : job.status === 'queued'
-                          ? 'border-amber-500/40 bg-amber-500/5'
-                          : job.status === 'completed'
-                          ? 'border-slate-800 bg-[#0b101b] hover:border-sky-500/40 cursor-pointer'
-                          : 'border-rose-500/40 bg-rose-500/10'
-                      }`}
-                    >
+                  const rowContent = (
+                    <>
                       <div className="flex min-w-0 items-center gap-3">
                         {ev ? (
                           <img
@@ -403,7 +406,7 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
                           </div>
                         )}
 
-                        <div className="min-w-0">
+                        <div className="min-w-0 text-left">
                           <div className="truncate font-mono-tabular text-xs font-bold text-white">
                             {job.original_name}
                           </div>
@@ -458,6 +461,37 @@ export const QrUploadModal: React.FC<QrUploadModalProps> = ({
                           </span>
                         )}
                       </div>
+                    </>
+                  );
+
+                  if (ev) {
+                    return (
+                      <button
+                        key={job.job_id}
+                        type="button"
+                        onClick={() => {
+                          onSelectEvent(ev);
+                          onClose();
+                        }}
+                        className="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-800 bg-[#0b101b] p-2.5 text-left transition hover:border-sky-500/40 cursor-pointer"
+                      >
+                        {rowContent}
+                      </button>
+                    );
+                  }
+
+                  return (
+                    <div
+                      key={job.job_id}
+                      className={`flex items-center justify-between gap-3 rounded-lg border p-2.5 transition ${
+                        job.status === 'processing'
+                          ? 'border-sky-500/50 bg-sky-500/10'
+                          : job.status === 'queued'
+                          ? 'border-amber-500/40 bg-amber-500/5'
+                          : 'border-rose-500/40 bg-rose-500/10'
+                      }`}
+                    >
+                      {rowContent}
                     </div>
                   );
                 })

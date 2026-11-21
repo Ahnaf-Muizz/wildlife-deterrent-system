@@ -42,13 +42,13 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const videoRef = useRef<HTMLImageElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const inFlightRef = useRef<boolean>(false);
+  const snapshotInFlightRef = useRef<boolean>(false);
   const lastAutoSaveEpochRef = useRef<number>(0);
+  const isOpenRef = useRef<boolean>(isOpen);
+  const toastTimerRef = useRef<number | null>(null);
+  const retryTimerRef = useRef<number | null>(null);
 
-  const [devices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [confThreshold, setConfThreshold] = useState<number>(0.5);
   const [autoSaveOnThreat, setAutoSaveOnThreat] = useState<boolean>(false);
   const [autoTriggerEsp32, setAutoTriggerEsp32] = useState<boolean>(true);
@@ -59,6 +59,26 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
   const [isCapturingSnapshot, setIsCapturingSnapshot] = useState<boolean>(false);
   const [snapshotToast, setSnapshotToast] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
+
+  const [mirrorH, setMirrorH] = useState<boolean>(true);
+  const [mirrorV, setMirrorV] = useState<boolean>(false);
+  const [rotation, setRotation] = useState<number>(180);
+  const [showHudOverlay, setShowHudOverlay] = useState<boolean>(true);
+  const [hudNotice, setHudNotice] = useState<string | null>(null);
+  const hudNoticeTimerRef = useRef<number | null>(null);
+
+  isOpenRef.current = isOpen;
+
+  const showHudNotice = useCallback((msg: string) => {
+    setHudNotice(msg);
+    if (hudNoticeTimerRef.current !== null) {
+      window.clearTimeout(hudNoticeTimerRef.current);
+    }
+    hudNoticeTimerRef.current = window.setTimeout(() => {
+      setHudNotice(null);
+      hudNoticeTimerRef.current = null;
+    }, 2200);
+  }, []);
 
   // Sync native <dialog> modal state
   useEffect(() => {
@@ -72,9 +92,17 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
   }, [isOpen]);
 
   const stopCameraStream = useCallback(() => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
+    if (retryTimerRef.current !== null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    if (hudNoticeTimerRef.current !== null) {
+      window.clearTimeout(hudNoticeTimerRef.current);
+      hudNoticeTimerRef.current = null;
     }
     if (videoRef.current) {
       videoRef.current.removeAttribute('src');
@@ -82,141 +110,180 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
     }
   }, []);
 
-  const startCameraStream = useCallback(
-    async (_deviceId?: string) => {
-      setCameraError(null);
-      try {
-        await fetch('/api/camera/control', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rotation: 180 }),
-        });
-      } catch {
-        // Ignore control sync error and continue starting stream
+  const startCameraStream = useCallback(async () => {
+    setCameraError(null);
+    try {
+      const res = await fetch('/api/camera/control');
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.settings) {
+          setMirrorH(Boolean(data.settings.mirror_h));
+          setMirrorV(Boolean(data.settings.mirror_v));
+          setRotation(Number(data.settings.rotation ?? 180));
+        }
       }
-      if (videoRef.current) {
-        videoRef.current.src = `/api/camera/stream?t=${Date.now()}`;
-      }
-    },
-    []
-  );
+    } catch {
+      // Ignore control sync error and continue starting stream
+    }
+    if (isOpenRef.current && videoRef.current) {
+      videoRef.current.src = `/api/camera/stream?t=${Date.now()}`;
+    }
+  }, []);
 
   useEffect(() => {
     if (isOpen) {
-      startCameraStream(selectedDeviceId || undefined);
+      void startCameraStream();
     } else {
       stopCameraStream();
       setDetections([]);
       setPrimaryTarget('None');
+      setHudNotice(null);
     }
     return () => {
       stopCameraStream();
     };
-  }, [isOpen, selectedDeviceId, startCameraStream, stopCameraStream]);
+  }, [isOpen, startCameraStream, stopCameraStream]);
 
-  // Draw tactical bounding boxes & telemetry labels onto the live full-screen <canvas>
-  const drawOverlay = useCallback((boxes: DetectionBox[]) => {
-    const canvas = overlayCanvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
+  // Draw tactical bounding boxes & non-overlapping telemetry labels onto the live full-screen <canvas>
+  const drawOverlay = useCallback(
+    (boxes: DetectionBox[]) => {
+      const canvas = overlayCanvasRef.current;
+      const video = videoRef.current;
+      if (!canvas || !video) return;
 
-    const rect = canvas.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return;
 
-    const cw = Math.round(rect.width);
-    const ch = Math.round(rect.height);
-    if (canvas.width !== cw || canvas.height !== ch) {
-      canvas.width = cw;
-      canvas.height = ch;
-    }
+      const cw = Math.round(rect.width);
+      const ch = Math.round(rect.height);
+      if (canvas.width !== cw || canvas.height !== ch) {
+        canvas.width = cw;
+        canvas.height = ch;
+      }
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const vw = video.naturalWidth || 1280;
-    const vh = video.naturalHeight || 720;
-    const scale = Math.min(canvas.width / vw, canvas.height / vh);
-    const drawnW = vw * scale;
-    const drawnH = vh * scale;
-    const offsetX = (canvas.width - drawnW) / 2;
-    const offsetY = (canvas.height - drawnH) / 2;
+      if (!showHudOverlay || boxes.length === 0) return;
 
-    const colorMap: Record<number, { stroke: string; fill: string; text: string }> = {
-      2: { stroke: '#f43f5e', fill: 'rgba(244, 63, 94, 0.92)', text: '#ffffff' }, // LARGE MAMMAL
-      1: { stroke: '#f59e0b', fill: 'rgba(245, 158, 11, 0.92)', text: '#090d14' }, // SMALL MAMMAL
-      0: { stroke: '#38bdf8', fill: 'rgba(56, 189, 248, 0.92)', text: '#090d14' }, // BIRD
-      3: { stroke: '#10b981', fill: 'rgba(16, 185, 129, 0.92)', text: '#090d14' }, // HUMAN / SAFE
-    };
+      const vw = video.naturalWidth || 1280;
+      const vh = video.naturalHeight || 720;
+      const scale = Math.min(canvas.width / vw, canvas.height / vh);
+      const drawnW = vw * scale;
+      const drawnH = vh * scale;
+      const offsetX = (canvas.width - drawnW) / 2;
+      const offsetY = (canvas.height - drawnH) / 2;
 
-    for (const det of boxes) {
-      const [nx1, ny1, nx2, ny2] = det.bbox_norm;
-      const x1 = offsetX + nx1 * drawnW;
-      const y1 = offsetY + ny1 * drawnH;
-      const x2 = offsetX + nx2 * drawnW;
-      const y2 = offsetY + ny2 * drawnH;
-      const bw = x2 - x1;
-      const bh = y2 - y1;
+      const colorMap: Record<number, { stroke: string; fill: string; text: string }> = {
+        2: { stroke: '#f43f5e', fill: 'rgba(244, 63, 94, 0.92)', text: '#ffffff' }, // LARGE MAMMAL
+        1: { stroke: '#f59e0b', fill: 'rgba(245, 158, 11, 0.92)', text: '#090d14' }, // SMALL MAMMAL
+        0: { stroke: '#38bdf8', fill: 'rgba(56, 189, 248, 0.92)', text: '#090d14' }, // BIRD
+        3: { stroke: '#10b981', fill: 'rgba(16, 185, 129, 0.92)', text: '#090d14' }, // HUMAN / SAFE
+      };
 
-      const palette = colorMap[det.class_id] || colorMap[0];
+      const boxDrawItems: Array<{
+        det: DetectionBox;
+        x1: number;
+        y1: number;
+        x2: number;
+        y2: number;
+        palette: { stroke: string; fill: string; text: string };
+      }> = [];
 
-      // Subtle translucent box tint
-      ctx.fillStyle = `${palette.stroke}18`;
-      ctx.fillRect(x1, y1, bw, bh);
+      // Pass 1: boxes and corner brackets
+      for (const det of boxes) {
+        const [nx1, ny1, nx2, ny2] = det.bbox_norm;
+        const x1 = offsetX + nx1 * drawnW;
+        const y1 = offsetY + ny1 * drawnH;
+        const x2 = offsetX + nx2 * drawnW;
+        const y2 = offsetY + ny2 * drawnH;
+        const bw = x2 - x1;
+        const bh = y2 - y1;
+        const palette = colorMap[det.class_id] || colorMap[0];
 
-      // Main hairline box
-      ctx.strokeStyle = palette.stroke;
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x1, y1, bw, bh);
+        ctx.fillStyle = `${palette.stroke}18`;
+        ctx.fillRect(x1, y1, bw, bh);
 
-      // Corner tactical brackets
-      const cLen = Math.max(12, Math.min(28, Math.min(bw, bh) * 0.22));
-      ctx.lineWidth = 4;
-      ctx.beginPath();
-      // Top-left
-      ctx.moveTo(x1, y1 + cLen);
-      ctx.lineTo(x1, y1);
-      ctx.lineTo(x1 + cLen, y1);
-      // Top-right
-      ctx.moveTo(x2 - cLen, y1);
-      ctx.lineTo(x2, y1);
-      ctx.lineTo(x2, y1 + cLen);
-      // Bottom-left
-      ctx.moveTo(x1, y2 - cLen);
-      ctx.lineTo(x1, y2);
-      ctx.lineTo(x1 + cLen, y2);
-      // Bottom-right
-      ctx.moveTo(x2 - cLen, y2);
-      ctx.lineTo(x2, y2);
-      ctx.lineTo(x2, y2 - cLen);
-      ctx.stroke();
+        ctx.strokeStyle = palette.stroke;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x1, y1, bw, bh);
 
-      // Label badge
-      const label = det.display_label;
+        const cLen = Math.max(12, Math.min(28, Math.min(bw, bh) * 0.22));
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1 + cLen);
+        ctx.lineTo(x1, y1);
+        ctx.lineTo(x1 + cLen, y1);
+        ctx.moveTo(x2 - cLen, y1);
+        ctx.lineTo(x2, y1);
+        ctx.lineTo(x2, y1 + cLen);
+        ctx.moveTo(x1, y2 - cLen);
+        ctx.lineTo(x1, y2);
+        ctx.lineTo(x1 + cLen, y2);
+        ctx.moveTo(x2 - cLen, y2);
+        ctx.lineTo(x2, y2);
+        ctx.lineTo(x2, y2 - cLen);
+        ctx.stroke();
+
+        boxDrawItems.push({ det, x1, y1, x2, y2, palette });
+      }
+
+      // Pass 2: non-overlapping clamped label pills
+      const placedPills: Array<[number, number, number, number]> = [];
+      const overlaps = (a: [number, number, number, number], b: [number, number, number, number]) =>
+        !(a[2] <= b[0] || b[2] <= a[0] || a[3] <= b[1] || b[3] <= a[1]);
+
       ctx.font = 'bold 13px "JetBrains Mono", Consolas, monospace';
-      const textWidth = ctx.measureText(label).width;
-      const padX = 10;
-      const badgeH = 26;
-      const badgeY = Math.max(4, y1 - badgeH);
+      for (const item of boxDrawItems) {
+        const label = item.det.display_label;
+        const padX = 10;
+        const badgeH = 26;
+        const badgeW = Math.min(canvas.width - 8, ctx.measureText(label).width + padX * 2);
 
-      ctx.fillStyle = palette.fill;
-      ctx.fillRect(x1, badgeY, textWidth + padX * 2, badgeH);
+        const clampRect = (rx: number, ry: number): [number, number, number, number] => {
+          const cx1 = Math.max(4, Math.min(canvas.width - 4 - badgeW, rx));
+          const cy1 = Math.max(4, Math.min(canvas.height - 4 - badgeH, ry));
+          return [cx1, cy1, cx1 + badgeW, cy1 + badgeH];
+        };
 
-      ctx.fillStyle = palette.text;
-      ctx.fillText(label, x1 + padX, badgeY + 17);
-    }
-  }, []);
+        const candidates: Array<[number, number, number, number]> = [
+          clampRect(item.x1, item.y1 - badgeH),
+          clampRect(item.x1 + 2, item.y1 + 2),
+          clampRect(item.x2 - badgeW, item.y1 - badgeH),
+          clampRect(item.x1, item.y2 + 2),
+        ];
+
+        let chosen = candidates.find((c) => !placedPills.some((p) => overlaps(c, p))) || candidates[0];
+        for (let step = 0; step < 3; step++) {
+          const hit = placedPills.find((p) => overlaps(chosen, p));
+          if (!hit) break;
+          chosen = clampRect(chosen[0], hit[3] + 2);
+        }
+        placedPills.push(chosen);
+
+        ctx.fillStyle = item.palette.fill;
+        ctx.fillRect(chosen[0], chosen[1], badgeW, badgeH);
+        ctx.fillStyle = item.palette.text;
+        ctx.fillText(label, chosen[0] + padX, chosen[1] + 17);
+      }
+    },
+    [showHudOverlay]
+  );
 
   // Send frame to backend /api/live/detect
   const sendFrameForDetection = useCallback(
     async (saveSnapshot = false) => {
+      if (!isOpenRef.current) return;
       const video = videoRef.current;
       if (!video) return;
-      if (!saveSnapshot && inFlightRef.current) return;
-
-      inFlightRef.current = true;
       if (saveSnapshot) {
+        if (snapshotInFlightRef.current) return;
+        snapshotInFlightRef.current = true;
         setIsCapturingSnapshot(true);
+      } else {
+        if (inFlightRef.current || snapshotInFlightRef.current) return;
+        inFlightRef.current = true;
       }
 
       try {
@@ -224,10 +291,7 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
         formData.append('use_csi', 'true');
         formData.append('conf', String(confThreshold));
         formData.append('auto_trigger', String(autoTriggerEsp32));
-
-        // Check if auto-save on threat should fire (with 6s cooldown)
-        const shouldSave = saveSnapshot;
-        formData.append('save_snapshot', String(shouldSave));
+        formData.append('save_snapshot', String(saveSnapshot));
 
         const res = await fetch('/api/live/detect', {
           method: 'POST',
@@ -236,6 +300,8 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
         if (!res.ok) return;
 
         const data: LiveDetectResponse = await res.json();
+        if (!isOpenRef.current) return;
+
         setDetections(data.detections);
         setPrimaryTarget(data.primary_target);
         setActionTaken(data.action_taken);
@@ -260,23 +326,32 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
               data.saved_event.confidence * 100
             )}%)`
           );
-          setTimeout(() => setSnapshotToast(null), 3500);
+          if (toastTimerRef.current !== null) {
+            window.clearTimeout(toastTimerRef.current);
+          }
+          toastTimerRef.current = window.setTimeout(() => {
+            setSnapshotToast(null);
+            toastTimerRef.current = null;
+          }, 3500);
         } else if (
+          !saveSnapshot &&
           autoSaveOnThreat &&
           data.primary_target !== 'None' &&
           data.primary_target !== 'SAFE' &&
           Date.now() - lastAutoSaveEpochRef.current > 6500
         ) {
           lastAutoSaveEpochRef.current = Date.now();
-          // Trigger an immediate snapshot save for this threat
-          sendFrameForDetection(true);
+          inFlightRef.current = false;
+          await sendFrameForDetection(true);
         }
       } catch {
         // Ignore transient frame errors
       } finally {
-        inFlightRef.current = false;
         if (saveSnapshot) {
+          snapshotInFlightRef.current = false;
           setIsCapturingSnapshot(false);
+        } else {
+          inFlightRef.current = false;
         }
       }
     },
@@ -290,11 +365,89 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
     ]
   );
 
+  // Scoped keyboard shortcuts inside Full-Screen Live HUD (top-layer safe)
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!isOpenRef.current) return;
+      const targetTag = (e.target as HTMLElement | null)?.tagName;
+      if (targetTag && ['INPUT', 'SELECT', 'TEXTAREA'].includes(targetTag)) return;
+
+      const key = e.key.toLowerCase();
+      if (key === 'm') {
+        e.preventDefault();
+        setMirrorH((prev) => {
+          const next = !prev;
+          showHudNotice(`HORIZONTAL MIRROR: ${next ? 'ON' : 'OFF'}`);
+          fetch('/api/camera/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mirror_h: next }),
+          }).catch(() => {});
+          return next;
+        });
+      } else if (key === 'v') {
+        e.preventDefault();
+        setMirrorV((prev) => {
+          const next = !prev;
+          showHudNotice(`VERTICAL MIRROR: ${next ? 'ON' : 'OFF'}`);
+          fetch('/api/camera/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mirror_v: next }),
+          }).catch(() => {});
+          return next;
+        });
+      } else if (key === 'r') {
+        e.preventDefault();
+        setRotation((prev) => {
+          const next = (prev + 90) % 360;
+          showHudNotice(`ROTATION: ${next}°`);
+          fetch('/api/camera/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rotation: next }),
+          }).catch(() => {});
+          return next;
+        });
+      } else if (key === 'f') {
+        e.preventDefault();
+        setRotation((prev) => {
+          const next = (prev + 180) % 360;
+          showHudNotice(`FLIP 180: ${next}°`);
+          fetch('/api/camera/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rotation: next }),
+          }).catch(() => {});
+          return next;
+        });
+      } else if (key === 's') {
+        e.preventDefault();
+        showHudNotice('CAPTURING SNAPSHOT & RUNNING AI...');
+        void sendFrameForDetection(true);
+      } else if (key === 'h') {
+        e.preventDefault();
+        setShowHudOverlay((prev) => {
+          const next = !prev;
+          showHudNotice(`TACTICAL HUD: ${next ? 'ON' : 'OFF'}`);
+          return next;
+        });
+      } else if (key === 'q') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose, sendFrameForDetection, showHudNotice]);
+
   // Continuous live detection loop while HUD is open
   useEffect(() => {
     if (!isOpen) return;
     const interval = window.setInterval(() => {
-      sendFrameForDetection(false);
+      void sendFrameForDetection(false);
     }, 320);
     return () => clearInterval(interval);
   }, [isOpen, sendFrameForDetection]);
@@ -369,8 +522,13 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
           ref={videoRef}
           alt="Jetson CSI Live Stream"
           onError={() => {
-            setTimeout(() => {
-              if (isOpen && videoRef.current) {
+            if (!isOpenRef.current) return;
+            if (retryTimerRef.current !== null) {
+              window.clearTimeout(retryTimerRef.current);
+            }
+            retryTimerRef.current = window.setTimeout(() => {
+              retryTimerRef.current = null;
+              if (isOpenRef.current && videoRef.current) {
                 videoRef.current.src = `/api/camera/stream?t=${Date.now()}`;
               }
             }, 800);
@@ -379,9 +537,52 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
         />
         <canvas
           ref={overlayCanvasRef}
+          style={{ display: showHudOverlay ? 'block' : 'none' }}
           className="pointer-events-none absolute inset-0 h-full w-full"
         />
-        <canvas ref={captureCanvasRef} className="hidden" />
+
+        {/* In-Dialog HUD Keyboard Notice & Legend (Top-Layer Safe) */}
+        {hudNotice && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-none absolute bottom-16 left-1/2 -translate-x-1/2 rounded-lg border border-sky-400/60 bg-[#090e1a]/95 px-4 py-2 font-mono-tabular text-xs font-bold text-sky-300 shadow-[0_0_20px_rgba(56,189,248,0.3)]"
+          >
+            {hudNotice}
+          </div>
+        )}
+        <div className="pointer-events-none absolute bottom-3 left-1/2 flex -translate-x-1/2 flex-wrap items-center gap-3 rounded-full border border-sky-400/30 bg-[#090e1a]/90 px-4 py-1.5 font-mono-tabular text-[11px] font-bold text-slate-300 backdrop-blur-md">
+          <span>
+            <b className="text-sky-400">[M]</b> Mirror:{' '}
+            <span className={mirrorH ? 'text-emerald-400' : 'text-slate-400'}>
+              {mirrorH ? 'ON' : 'OFF'}
+            </span>
+          </span>
+          <span>
+            <b className="text-sky-400">[V]</b> Flip-V:{' '}
+            <span className={mirrorV ? 'text-emerald-400' : 'text-slate-400'}>
+              {mirrorV ? 'ON' : 'OFF'}
+            </span>
+          </span>
+          <span>
+            <b className="text-sky-400">[R]</b> Rot: {rotation}°
+          </span>
+          <span>
+            <b className="text-sky-400">[F]</b> Flip 180
+          </span>
+          <span>
+            <b className="text-sky-400">[S]</b> Snap
+          </span>
+          <span>
+            <b className="text-sky-400">[H]</b> HUD:{' '}
+            <span className={showHudOverlay ? 'text-emerald-400' : 'text-slate-400'}>
+              {showHudOverlay ? 'ON' : 'OFF'}
+            </span>
+          </span>
+          <span>
+            <b className="text-rose-400">[Esc/Q]</b> Close
+          </span>
+        </div>
 
         {cameraError && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 p-6 text-center">
@@ -389,7 +590,7 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
             <div className="font-mono-tabular text-sm font-bold text-white">{cameraError}</div>
             <button
               type="button"
-              onClick={() => startCameraStream(selectedDeviceId || undefined)}
+              onClick={() => void startCameraStream()}
               className="mt-4 flex items-center gap-2 rounded-lg bg-sky-500 px-4 py-2 font-mono-tabular text-xs font-bold text-slate-950 cursor-pointer"
             >
               <RefreshCw className="h-4 w-4" />
@@ -442,24 +643,8 @@ export const FullPageLiveCamera: React.FC<FullPageLiveCameraProps> = ({
 
       {/* Bottom Tactical Control Deck */}
       <div className="flex flex-wrap items-center justify-between gap-4 border-t border-slate-800 bg-[#090e1a] px-6 py-3.5">
-        {/* Left: Camera Selector & Sensitivity */}
+        {/* Left: Sensitivity & Automation Toggles */}
         <div className="flex flex-wrap items-center gap-4">
-          {devices.length > 1 && (
-            <div className="flex items-center gap-2">
-              <span className="font-mono-tabular text-xs text-slate-400">CAMERA:</span>
-              <select
-                value={selectedDeviceId}
-                onChange={(e) => setSelectedDeviceId(e.target.value)}
-                className="rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono-tabular text-xs text-white"
-              >
-                {devices.map((dev, i) => (
-                  <option key={dev.deviceId || i} value={dev.deviceId}>
-                    {dev.label || `Camera ${i + 1}`}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
 
           <div className="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/90 px-3 py-1.5">
             <span className="font-mono-tabular text-xs text-slate-400">CONFIDENCE:</span>

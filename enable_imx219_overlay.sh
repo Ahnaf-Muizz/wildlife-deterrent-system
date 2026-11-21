@@ -34,8 +34,19 @@ if [ -f "/boot/$(basename "$BASE_DTB")" ]; then
     cp "$BASE_DTB" "/boot/$(basename "$BASE_DTB")"
 fi
 
+# Detect current root PARTUUID dynamically instead of hardcoding a single SD/NVMe UUID
+ROOT_PARTUUID=$(findmnt -n -o PARTUUID / 2>/dev/null || true)
+if [ -z "$ROOT_PARTUUID" ]; then
+    echo ">> ERROR: Unable to determine root PARTUUID automatically. Aborting extlinux.conf update."
+    exit 1
+fi
+
+if [ -f "$EXTLINUX" ] && [ ! -f "${EXTLINUX}.orig" ]; then
+    cp "$EXTLINUX" "${EXTLINUX}.orig"
+fi
+
 # Update extlinux.conf
-echo ">> Updating $EXTLINUX..."
+echo ">> Updating $EXTLINUX (root=PARTUUID=$ROOT_PARTUUID)..."
 cat << EOF > "$EXTLINUX"
 TIMEOUT 30
 DEFAULT primary
@@ -47,7 +58,7 @@ LABEL primary
       LINUX /boot/Image
       FDT $BASE_DTB
       INITRD /boot/initrd
-      APPEND \${cbootargs} root=PARTUUID=fa6264be-441f-46fd-96c3-282b3034b27e rw rootwait rootfstype=ext4 mminit_loglevel=4 console=ttyTCU0,115200 firmware_class.path=/etc/firmware fbcon=map:0 video=efifb:off console=tty0 efi_pstore.pstore_disable=1 pstore.backend=ramoops efi=runtime pci=pcie_bus_perf nvme.use_threaded_interrupts=1 swiotlb=2048
+      APPEND \${cbootargs} root=PARTUUID=${ROOT_PARTUUID} rw rootwait rootfstype=ext4 mminit_loglevel=4 console=ttyTCU0,115200 firmware_class.path=/etc/firmware fbcon=map:0 video=efifb:off console=tty0 efi_pstore.pstore_disable=1 pstore.backend=ramoops efi=runtime pci=pcie_bus_perf nvme.use_threaded_interrupts=1 swiotlb=2048
       OVERLAYS $OVERLAY
 EOF
 
